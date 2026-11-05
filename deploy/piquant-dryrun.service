@@ -1,0 +1,40 @@
+[Unit]
+Description=PiQuant 14-Day Autonomous Paper Money Dry Run Service (Raspberry Pi 5)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+Documentation=https://github.com/everett6/PiQuant
+
+[Service]
+Type=simple
+User=piquant
+Group=piquant
+WorkingDirectory=/var/lib/piquant
+ExecStart=/usr/local/bin/piquant dry-run --addr :8080 --data /var/lib/piquant/data --log-dir /var/log/piquant --secrets-dir /etc/piquant --duration-hours 336 --capital 100000 --max-drawdown 2.0
+Restart=always
+RestartSec=3s
+
+# Real-Time Scheduling & CPU Pinning (Bypasses standard CFS task scheduler)
+# Cores 2 & 3 are isolated via isolcpus=2,3 in /boot/firmware/cmdline.txt on Raspberry Pi 5
+CPUAffinity=2,3
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=80
+LimitRTPRIO=99
+LimitMEMLOCK=infinity
+
+# Linux Capabilities for Zero-Latency Thread Prioritization
+AmbientCapabilities=CAP_SYS_NICE CAP_IPC_LOCK
+CapabilityBoundingSet=CAP_SYS_NICE CAP_IPC_LOCK
+
+# Resource bounds for Raspberry Pi 5 (8 GB RAM target)
+MemoryHigh=3500M
+MemoryMax=4500M
+
+# Security sandbox
+NoNewPrivileges=false
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/piquant /var/log/piquant /etc/piquant
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

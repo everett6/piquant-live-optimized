@@ -187,3 +187,50 @@ func TestEngineStateGoesStale(t *testing.T) {
 		t.Fatal("Idle left the state running")
 	}
 }
+
+func TestDryRunCLIFlagsAndStatus(t *testing.T) {
+	tempDir := t.TempDir()
+	stateFile := filepath.Join(tempDir, "paper", "dryrun_state.json")
+
+	// Verify printDryRunStatus gracefully handles non-existent state
+	if err := printDryRunStatus(stateFile); err != nil {
+		t.Fatalf("unexpected error on missing state: %v", err)
+	}
+
+	// Create dummy state
+	_ = os.MkdirAll(filepath.Dir(stateFile), 0o755)
+	dummyState := []byte(`{
+		"start_time": "2026-11-01T00:00:00Z",
+		"target_end_time": "2026-11-15T00:00:00Z",
+		"days_elapsed": 4,
+		"hours_remaining": 240.0,
+		"initial_capital": 100000.0,
+		"cash": 99500.0,
+		"equity": 100450.0,
+		"peak_equity": 100500.0,
+		"realized_pnl": 350.0,
+		"unrealized_pnl": 100.0,
+		"total_return_pct": 0.45,
+		"max_drawdown_pct": 0.05,
+		"circuit_halted": false,
+		"total_trades": 18,
+		"win_rate": 66.7,
+		"positions": {
+			"BTCUSDT": {
+				"symbol": "BTCUSDT",
+				"size": 0.1,
+				"avg_entry_price": 50000.0,
+				"mark_price": 50100.0,
+				"unrealized_pnl": 10.0,
+				"total_trades": 12
+			}
+		}
+	}`)
+	if err := os.WriteFile(stateFile, dummyState, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := printDryRunStatus(stateFile); err != nil {
+		t.Fatalf("unexpected error printing dry run status: %v", err)
+	}
+}

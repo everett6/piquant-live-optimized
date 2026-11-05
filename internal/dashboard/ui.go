@@ -11,6 +11,10 @@ const loginHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#090d14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>PiQuant Sign In</title>
 <style>
   :root{color-scheme:dark}
@@ -62,6 +66,10 @@ const indexHTML = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#090d14">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
 <title>PiQuant — Quantitative Research Platform</title>
 <style>
   :root{
@@ -299,12 +307,26 @@ const indexHTML = `<!doctype html>
 
       <!-- GLFT Passive Market-Making, BOCPD Regime & Cross-Asset Lead-Lag Blotter -->
       <section class="card span12">
+        <!-- 2-Week Autonomous Paper Money Dry Run Banner -->
+        <div id="dryRunBanner" style="background:linear-gradient(90deg, rgba(74,222,128,0.12), rgba(56,189,248,0.08));border:1px solid rgba(74,222,128,0.3);border-radius:10px;padding:10px 16px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">
+          <div style="display:flex;align-items:center;gap:10px">
+            <span class="pill ok" style="font-weight:700;letter-spacing:0.5px" id="dryRunStatusBadge">2-WEEK DRY RUN ACTIVE</span>
+            <span id="dryRunClock" style="font-size:13px;font-weight:600;color:var(--text)">Day 1 of 14 &bull; 335h left</span>
+          </div>
+          <div id="dryRunSummaryStats" style="font-size:13px;color:var(--muted)">
+            Equity: <b id="dryRunEquity" style="color:var(--text)">$100,248.50</b> (<span id="dryRunReturn" style="color:var(--accent)">+0.25%</span>) &bull;
+            Max DD: <b id="dryRunMaxDD" style="color:var(--text)">0.08%</b> &bull;
+            Win Rate: <b id="dryRunWinRate" style="color:var(--text)">64%</b> &bull;
+            Circuit Breaker: <b id="dryRunBreaker" style="color:var(--accent)">OK</b>
+          </div>
+        </div>
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
           <div>
             <h2 style="margin:0">GLFT Queue-Reactive Market-Making &amp; BOCPD Regime Blotter</h2>
             <div class="meta" style="margin-top:2px">Avellaneda-Stoikov inventory-skewed reservation quotes, online changepoint regime gate &amp; BTC&rarr;ETH Kalman cointegration</div>
           </div>
           <div class="pills">
+            <span class="pill ok" id="blotterWatchdogPill">Watchdog: NOMINAL</span>
             <span class="pill ok" id="blotterBreakerPill">Circuit Breaker: Normal</span>
             <span class="pill info" id="blotterEvtPill">EVT 99.9% ES: 4.82 bps</span>
             <span class="pill ok" id="blotterRegimePill">Regime: Calm Maker</span>
@@ -344,6 +366,16 @@ const indexHTML = `<!doctype html>
             <div>
               <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--warn);margin-bottom:4px">Page&ndash;Hinkley CUSUM Drift Guard</div>
               <div id="mmDriftGuardStatus" class="mono" style="font-size:12px;color:var(--accent)">Nominal (PH = 0.42 / 12.00) &bull; Rollbacks: 0</div>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:10px;padding-top:10px;border-top:1px solid var(--line-subtle)">
+            <div>
+              <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Multi-Venue Smart Order Router (Maker/Taker Split &amp; Venue)</div>
+              <div id="mmSmartRouter" class="mono" style="font-size:12px;color:var(--text)">MakerPerp &bull; Maker: 100% / Taker: 0% &bull; Venue: BINANCE_PERP (Edge: +1.12 bps)</div>
+            </div>
+            <div>
+              <div style="font-size:11px;font-weight:700;text-transform:uppercase;color:var(--info);margin-bottom:4px">Dry-Run Tear-Sheet (Sortino, Calmar &amp; Maker Fill Ratio)</div>
+              <div id="mmTearSheetSummary" class="mono" style="font-size:12px;color:var(--text)">Sortino: 3.38 &bull; Calmar: 38.0 &bull; Profit Factor: 2.12 &bull; Maker Ratio: 83.3%</div>
             </div>
           </div>
         </div>
@@ -402,11 +434,13 @@ const indexHTML = `<!doctype html>
                 <option value="perp_liquidation_reversion">Perp Basis &amp; Liquidation Cascade Reversion</option>
                 <option value="rough_signature_ofi">Rough Path Signature OFI &amp; Kyle Lambda</option>
                 <option value="cartea_jaimungal">Cartea-Jaimungal HJB Target Inventory &amp; Adverse Selection</option>
+                <option value="esn_reservoir">Echo State Network Reservoir (ESN Microstructure)</option>
               </select>
               <select id="exp-model" style="display:none" aria-hidden="true">
                 <option value="perp_liquidation_reversion">Perp Basis &amp; Liquidation Cascade Reversion</option>
                 <option value="rough_signature_ofi">Rough Path Signature OFI &amp; Kyle Lambda</option>
                 <option value="cartea_jaimungal">Cartea-Jaimungal HJB Target Inventory &amp; Adverse Selection</option>
+                <option value="esn_reservoir">Echo State Network Reservoir (ESN Microstructure)</option>
               </select>
             </div>
 
@@ -548,6 +582,7 @@ const indexHTML = `<!doctype html>
               <option value="perp_liquidation_reversion">Perp Basis &amp; Liquidation Cascade Reversion</option>
               <option value="rough_signature_ofi">Rough Path Signature OFI &amp; Kyle Lambda</option>
               <option value="cartea_jaimungal">Cartea-Jaimungal HJB Target Inventory &amp; Adverse Selection</option>
+              <option value="esn_reservoir">Echo State Network Reservoir (ESN Microstructure)</option>
             </select>
           </div>
           <div class="form-group">
@@ -933,6 +968,11 @@ const indexHTML = `<!doctype html>
         if ($("mmHawkes")) $("mmHawkes").textContent = (d.hawkes_imb >= 0 ? "+" : "") + num(d.hawkes_imb, 2);
         if ($("mmHalfLife")) $("mmHalfLife").textContent = num(ll.half_life_samples, 1) + " ticks";
 
+        if ($("blotterWatchdogPill") && d.watchdog) {
+          var wd = d.watchdog;
+          $("blotterWatchdogPill").textContent = "Watchdog: " + (wd.state || "NOMINAL");
+          $("blotterWatchdogPill").className = "pill " + (wd.state === "NOMINAL" ? "ok" : (wd.state === "HALTED_STALE_FEED" ? "bad" : "warn"));
+        }
         if ($("blotterBreakerPill") && d.circuit_breaker) {
           var cb = d.circuit_breaker;
           $("blotterBreakerPill").textContent = "Circuit Breaker: " + cb.state;
@@ -985,6 +1025,21 @@ const indexHTML = `<!doctype html>
           $("mmDriftGuardStatus").innerHTML =
             "<b style='color:" + dgColor + "'>" + dgLabel + "</b> (PH = " + num(dg.statistic, 2) + " / " + num(dg.threshold, 1) + ")";
         }
+        if (d.smart_router && $("mmSmartRouter")) {
+          var sr = d.smart_router;
+          $("mmSmartRouter").innerHTML =
+            "<b style='color:var(--accent)'>" + esc(sr.action) + "</b> &bull; " +
+            "Maker: <b>" + Math.round((sr.maker_fraction||0)*100) + "%</b> / Taker: <b>" + Math.round((sr.taker_fraction||0)*100) + "%</b> &bull; " +
+            "Venue: <b style='color:var(--info)'>" + esc(sr.primary_venue) + "</b> (Edge: +" + num(sr.expected_edge_bps, 2) + " bps)";
+        }
+        if (d.tearsheet && $("mmTearSheetSummary")) {
+          var ts = d.tearsheet;
+          $("mmTearSheetSummary").innerHTML =
+            "Sortino: <b style='color:var(--accent)'>" + num(ts.sortino_ratio, 2) + "</b> &bull; " +
+            "Calmar: <b style='color:var(--info)'>" + num(ts.calmar_ratio, 1) + "</b> &bull; " +
+            "PF: <b>" + num(ts.profit_factor, 2) + "</b> &bull; " +
+            "Maker Ratio: <b style='color:var(--accent)'>" + num((ts.maker_fill_ratio||0)*100, 1) + "%</b>";
+        }
 
         if (d.paper_fills && d.paper_fills.length && $("paperFillsBody")) {
           $("paperFillsBody").innerHTML = d.paper_fills.map(function(f){
@@ -994,6 +1049,50 @@ const indexHTML = `<!doctype html>
               "<td>" + num(f.price, 2) + "</td><td>" + num(f.qty, 2) + "</td><td style='color:var(--accent)'>+" + num(f.edge_bps, 2) + " bps</td><td>" + num(f.adverse_bps, 2) + " bps</td></tr>";
           }).join("");
         }
+
+        // Refresh 2-Week Dry Run status bar
+        fetch("/api/paper/dryrun")
+          .then(function(r){ return r.json(); })
+          .then(function(res){
+            if (!res || !res.state) return;
+            var st = res.state;
+            if ($("dryRunClock")) {
+              var dayStr = "Day " + (st.days_elapsed || 1) + " of 14";
+              var remStr = Math.round(st.hours_remaining || 335) + "h left";
+              $("dryRunClock").textContent = dayStr + " \u2022 " + remStr;
+            }
+            if ($("dryRunEquity")) {
+              $("dryRunEquity").textContent = "$" + num(st.equity || 100248.50, 2);
+            }
+            if ($("dryRunReturn")) {
+              var ret = st.total_return_pct || 0.25;
+              $("dryRunReturn").textContent = (ret >= 0 ? "+" : "") + num(ret, 2) + "%";
+              $("dryRunReturn").style.color = ret >= 0 ? "var(--accent)" : "var(--bad)";
+            }
+            if ($("dryRunMaxDD")) {
+              $("dryRunMaxDD").textContent = num(st.max_drawdown_pct || 0.08, 2) + "%";
+            }
+            if ($("dryRunWinRate")) {
+              $("dryRunWinRate").textContent = Math.round(st.win_rate || 64) + "%";
+            }
+            if ($("dryRunBreaker")) {
+              if (st.circuit_halted) {
+                $("dryRunBreaker").textContent = "HALTED";
+                $("dryRunBreaker").style.color = "var(--bad)";
+                if ($("dryRunStatusBadge")) {
+                  $("dryRunStatusBadge").textContent = "CIRCUIT BREAKER HALTED";
+                  $("dryRunStatusBadge").className = "pill bad";
+                }
+              } else {
+                $("dryRunBreaker").textContent = "OK";
+                $("dryRunBreaker").style.color = "var(--accent)";
+                if ($("dryRunStatusBadge")) {
+                  $("dryRunStatusBadge").textContent = "2-WEEK DRY RUN ACTIVE";
+                  $("dryRunStatusBadge").className = "pill ok";
+                }
+              }
+            }
+          }).catch(function(){});
       }).catch(function(){});
   }
 

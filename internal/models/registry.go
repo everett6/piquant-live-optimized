@@ -176,6 +176,20 @@ func Registry() []ModelSpec {
 			Limitations: "Assumes continuous Poisson fill intensities without discrete queue priority jumps.",
 			Calibration: "Calibrated via running penalty phi, terminal penalty alpha, and liquidity intensity kappa.",
 		},
+		// 11. Minutes Horizon: Echo State Network (ESN) / Reservoir Computing Microstructure Model
+		{
+			ID:          "esn_reservoir",
+			Name:        "Echo State Reservoir Microstructure",
+			Category:    HorizonMinutes,
+			Horizons:    []string{"30s", "1m", "5m"},
+			Features:    []string{"imb_l1", "imb_l5", "imb_l20", "micro_dev", "spread_bps", "ofi_1s", "mlofi_1s", "vol_30s_bps", "ret_1s_bps", "trade_imb_5s"},
+			Algorithm:   "Leaky Echo State Network (N_res=16, rho=0.85, alpha=0.35) + Direct Skip Ridge Readout",
+			Version:     "v1.0.0",
+			Description: "Projects 16 core microstructure features into a deterministic cyclic-chord recurrent reservoir with leaky tanh dynamics and direct linear skip connections.",
+			Assumptions: "Short-term order book memory satisfies the Echo State Property (spectral radius < 1) and separates non-linear flow trajectories in reservoir state space.",
+			Limitations: "Fixed reservoir topology does not adapt recurrent weights online; relies on regularized readout calibration.",
+			Calibration: "Solved in closed form via L2-regularized Gauss-Jordan normal equations over standardized reservoir states and skip residuals.",
+		},
 		// 8. Hours Horizon: Volatility Regime Filter
 		{
 			ID:          "vol_regime_ridge",

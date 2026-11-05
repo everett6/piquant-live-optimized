@@ -52,6 +52,8 @@ func main() {
 		err = runDashboard(ctx, args)
 	case "agent":
 		err = runAgent(ctx, args)
+	case "dry-run", "dryrun":
+		err = runDryRun(ctx, args)
 	case "secrets":
 		err = runSecrets(args)
 	case "version", "-v", "--version":
@@ -79,6 +81,7 @@ func usage() {
   piquant doctor      check this board and its network peer
   piquant dashboard   serve the read-only control panel (Raspberry Pi 3B)
   piquant agent       expose engine status to the panel (Raspberry Pi 5)
+  piquant dry-run     launch 14-day autonomous paper money dry run with live public feeds
   piquant secrets     manage the local credential store
   piquant version     print build information
 

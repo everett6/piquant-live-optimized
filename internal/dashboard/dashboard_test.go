@@ -516,3 +516,87 @@ func TestClientIP(t *testing.T) {
 		t.Fatalf("clientIP with a proxy = %q", got)
 	}
 }
+
+func TestPaperDryRunEndpoint(t *testing.T) {
+	srv := newTestServer(t, nil)
+	h := srv.Handler()
+
+	if rec := get(t, h, http.MethodGet, "/api/paper/dryrun", nil, nil); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/paper/dryrun code = %d, want 401", rec.Code)
+	}
+
+	recAuth := get(t, h, http.MethodGet, "/api/paper/dryrun", map[string]string{"Authorization": "Bearer " + peerToken}, nil)
+	if recAuth.Code != http.StatusOK {
+		t.Fatalf("authenticated /api/paper/dryrun code = %d, want 200", recAuth.Code)
+	}
+
+	var res map[string]any
+	if err := json.Unmarshal(recAuth.Body.Bytes(), &res); err != nil {
+		t.Fatalf("failed to decode JSON response: %v", err)
+	}
+	if res["status"] != "active" {
+		t.Errorf("expected status 'active', got %v", res["status"])
+	}
+	st, ok := res["state"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected state object in response")
+	}
+	if st["initial_capital"] != 100000.0 {
+		t.Errorf("expected initial_capital 100000, got %v", st["initial_capital"])
+	}
+	if _, ok := res["tearsheet"].(map[string]any); !ok {
+		t.Errorf("expected tearsheet object in /api/paper/dryrun response")
+	}
+	if _, ok := res["smart_router"].(map[string]any); !ok {
+		t.Errorf("expected smart_router object in /api/paper/dryrun response")
+	}
+	if _, ok := res["watchdog"].(map[string]any); !ok {
+		t.Errorf("expected watchdog object in /api/paper/dryrun response")
+	}
+}
+
+func TestPWAManifestIconAndTearSheetEndpoints(t *testing.T) {
+	srv := newTestServer(t, nil)
+	h := srv.Handler()
+
+	// 1. GET /manifest.json
+	recManifest := get(t, h, http.MethodGet, "/manifest.json", nil, nil)
+	if recManifest.Code != http.StatusOK {
+		t.Fatalf("/manifest.json status = %d, want 200", recManifest.Code)
+	}
+	var manifest map[string]any
+	if err := json.Unmarshal(recManifest.Body.Bytes(), &manifest); err != nil {
+		t.Fatalf("invalid /manifest.json JSON: %v", err)
+	}
+	if manifest["name"] != "PiQuant Live" || manifest["short_name"] != "PiQuant" || manifest["display"] != "standalone" {
+		t.Errorf("unexpected manifest metadata: %+v", manifest)
+	}
+
+	// 2. GET /icon.svg
+	recIcon := get(t, h, http.MethodGet, "/icon.svg", nil, nil)
+	if recIcon.Code != http.StatusOK {
+		t.Fatalf("/icon.svg status = %d, want 200", recIcon.Code)
+	}
+	if !strings.Contains(recIcon.Header().Get("Content-Type"), "image/svg+xml") {
+		t.Errorf("expected Content-Type image/svg+xml, got %q", recIcon.Header().Get("Content-Type"))
+	}
+	if !strings.Contains(recIcon.Body.String(), "<svg") {
+		t.Errorf("expected SVG payload in /icon.svg")
+	}
+
+	// 3. GET /api/paper/tearsheet
+	if recUnauth := get(t, h, http.MethodGet, "/api/paper/tearsheet", nil, nil); recUnauth.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated /api/paper/tearsheet = %d, want 401", recUnauth.Code)
+	}
+	recTS := get(t, h, http.MethodGet, "/api/paper/tearsheet", map[string]string{"Authorization": "Bearer " + peerToken}, nil)
+	if recTS.Code != http.StatusOK {
+		t.Fatalf("authenticated /api/paper/tearsheet = %d, want 200", recTS.Code)
+	}
+	var tsBody map[string]any
+	if err := json.Unmarshal(recTS.Body.Bytes(), &tsBody); err != nil {
+		t.Fatalf("failed to decode /api/paper/tearsheet: %v", err)
+	}
+	if _, ok := tsBody["tearsheet"].(map[string]any); !ok {
+		t.Errorf("expected tearsheet field in /api/paper/tearsheet")
+	}
+}

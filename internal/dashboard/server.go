@@ -191,6 +191,8 @@ type Options struct {
 	Manager *experiment.Manager
 	// InitialMode: "simple" (default) or "advanced".
 	Mode string
+	// DryRun, when set, exposes the 14-day autonomous paper money dry run engine.
+	DryRun any
 }
 
 // Server is the dashboard HTTP server.

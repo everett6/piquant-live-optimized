@@ -48,11 +48,11 @@ var TempNaN = math.NaN()
 // Throttle decodes the Raspberry Pi firmware's under-voltage and thermal flags.
 // On a non-Pi board it is the zero value and Available is false.
 type Throttle struct {
-	Available     bool   `json:"available"`
-	UnderVoltage  bool   `json:"under_voltage"`
-	FreqCapped    bool   `json:"freq_capped"`
-	Throttled     bool   `json:"throttled"`
-	SoftTempLimit bool   `json:"soft_temp_limit"`
+	Available     bool `json:"available"`
+	UnderVoltage  bool `json:"under_voltage"`
+	FreqCapped    bool `json:"freq_capped"`
+	Throttled     bool `json:"throttled"`
+	SoftTempLimit bool `json:"soft_temp_limit"`
 
 	// Active flags (current instant, bits 0-3):
 	ActiveUnderVoltage  bool `json:"active_under_voltage"`   // Bit 0: Under-voltage detected right now

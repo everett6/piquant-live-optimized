@@ -158,13 +158,13 @@ func TestDecodeThrottleBits(t *testing.T) {
 		{0x40000, Throttle{Available: true, Throttled: true, HistoricalThrottled: true}},
 		{0x80000, Throttle{Available: true, SoftTempLimit: true, HistoricalSoftTempLimit: true}},
 		{0x50005, Throttle{
-			Available:               true,
-			UnderVoltage:            true,
-			Throttled:               true,
-			ActiveUnderVoltage:      true,
-			ActiveThrottled:         true,
-			HistoricalUnderVoltage:  true,
-			HistoricalThrottled:     true,
+			Available:              true,
+			UnderVoltage:           true,
+			Throttled:              true,
+			ActiveUnderVoltage:     true,
+			ActiveThrottled:        true,
+			HistoricalUnderVoltage: true,
+			HistoricalThrottled:    true,
 		}},
 	} {
 		got := DecodeThrottle(tc.raw)

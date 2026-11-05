@@ -51,6 +51,18 @@ func (w *logisticWrapper) Predict(x *[common.FeatureCount]float64) float64 {
 	return w.mod.Logit(x) * 2.0
 }
 
+type esnWrapper struct {
+	mod *common.ESNReservoirModel
+}
+
+func (w *esnWrapper) Fit(samples []common.Sample, idx []int) error {
+	return w.mod.Fit(samples, idx)
+}
+
+func (w *esnWrapper) Predict(x *[common.FeatureCount]float64) float64 {
+	return w.mod.Predict(x)
+}
+
 // InstantiateModel creates an unfitted predictor for the specified model family.
 func InstantiateModel(modelName string, lambda float64, params map[string]any) ContinuousModel {
 	switch modelName {
@@ -101,6 +113,8 @@ func InstantiateModel(modelName string, lambda float64, params map[string]any) C
 			gamma = g
 		}
 		return common.NewCarteaJaimungalMM(gamma, 1.5, 2.0, 0.001, 0.01, 0.5, 60.0)
+	case "esn_reservoir":
+		return &esnWrapper{mod: common.NewESNReservoirModel(lambda)}
 	default:
 		return &common.Ridge{Lam: lambda}
 	}
