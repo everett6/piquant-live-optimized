@@ -129,6 +129,19 @@ type Engine struct {
 	volSum      float64
 	volSq       float64
 
+	// Novel Quant Algorithms state:
+	// 1. Online Hawkes trade intensity clustering
+	hawkesBuy   float64
+	hawkesSell  float64
+	hawkesLastT int64
+	// 2. Volume-synchronized order flow toxicity (VPIN)
+	vpinVolBucket float64
+	vpinCurrBuy   float64
+	vpinCurrSell  float64
+	vpinDiffs     [8]float64
+	vpinDiffIdx   int
+	vpinFilled    int
+
 	lastRecv  int64
 	ready     bool
 	emitted   bool
@@ -343,7 +356,8 @@ func (e *Engine) update(book *orderbook.Book, d *event.DepthEvent, t int64) {
 // trade records one print.
 func (e *Engine) trade(tr *event.TradeEvent, t int64) {
 	q := float64(tr.Qty)
-	if tr.Side == event.SideSell {
+	isBuy := tr.Side != event.SideSell
+	if !isBuy {
 		q = -q
 	}
 	b := e.bucketFor(t)
@@ -352,6 +366,54 @@ func (e *Engine) trade(tr *event.TradeEvent, t int64) {
 	e.tr1 += q
 	e.tr5 += q
 	e.cnt1++
+
+	// Advance online Hawkes process intensity
+	if e.hawkesLastT > 0 && t > e.hawkesLastT {
+		dtSec := float64(t-e.hawkesLastT) / 1e9
+		decay := math.Exp(-2.0 * dtSec) // 0.5s half life
+		e.hawkesBuy = 0.1 + (e.hawkesBuy-0.1)*decay
+		e.hawkesSell = 0.1 + (e.hawkesSell-0.1)*decay
+	}
+	e.hawkesLastT = t
+	jump := math.Log(1.0 + math.Abs(q)/float64(event.QtyScale))
+	if isBuy {
+		e.hawkesBuy += 0.8 * jump
+		e.hawkesSell += 0.2 * jump
+	} else {
+		e.hawkesSell += 0.8 * jump
+		e.hawkesBuy += 0.2 * jump
+	}
+
+	// Advance Volume-Synchronized Probability of Toxicity (VPIN)
+	baseQty := math.Abs(q) / float64(event.QtyScale)
+	bucketVol := e.vpinVolBucket
+	if bucketVol <= 0 {
+		bucketVol = 2.0 // default 2 base units per volume bucket
+		e.vpinVolBucket = bucketVol
+	}
+	rem := baseQty
+	for rem > 0 {
+		tot := e.vpinCurrBuy + e.vpinCurrSell
+		need := bucketVol - tot
+		take := math.Min(rem, need)
+		if isBuy {
+			e.vpinCurrBuy += take
+		} else {
+			e.vpinCurrSell += take
+		}
+		rem -= take
+
+		if e.vpinCurrBuy+e.vpinCurrSell >= bucketVol {
+			diff := math.Abs(e.vpinCurrBuy - e.vpinCurrSell)
+			e.vpinDiffs[e.vpinDiffIdx] = diff
+			e.vpinDiffIdx = (e.vpinDiffIdx + 1) % len(e.vpinDiffs)
+			if e.vpinFilled < len(e.vpinDiffs) {
+				e.vpinFilled++
+			}
+			e.vpinCurrBuy = 0
+			e.vpinCurrSell = 0
+		}
+	}
 }
 
 // prevMidAfter returns the mid the book has after the current update.
@@ -490,6 +552,57 @@ func imbalance(b, a int64) float32 {
 		return 0
 	}
 	return float32(float64(b-a) / float64(s))
+}
+
+// HawkesImbalance returns the current Hawkes trade arrival intensity imbalance in [-1, 1].
+func (e *Engine) HawkesImbalance(t int64) float64 {
+	hBuy, hSell := e.hawkesBuy, e.hawkesSell
+	if e.hawkesLastT > 0 && t > e.hawkesLastT {
+		dtSec := float64(t-e.hawkesLastT) / 1e9
+		decay := math.Exp(-2.0 * dtSec)
+		hBuy = 0.1 + (hBuy-0.1)*decay
+		hSell = 0.1 + (hSell-0.1)*decay
+	}
+	tot := hBuy + hSell
+	if tot < 1e-9 {
+		return 0
+	}
+	return (hBuy - hSell) / tot
+}
+
+// VPIN returns the current Volume-Synchronized Probability of Toxicity in [0, 1].
+func (e *Engine) VPIN() float64 {
+	if e.vpinFilled == 0 {
+		return 0
+	}
+	var sumDiff float64
+	for i := 0; i < e.vpinFilled; i++ {
+		sumDiff += e.vpinDiffs[i]
+	}
+	tot := float64(e.vpinFilled) * e.vpinVolBucket
+	if tot <= 0 {
+		return 0
+	}
+	return sumDiff / tot
+}
+
+// StoikovPrice returns the non-linear transition fair value.
+func (e *Engine) StoikovPrice(book *orderbook.Book) float64 {
+	if !book.Ready || !book.Anchored {
+		return 0
+	}
+	bids := &book.Levels[orderbook.Bids]
+	asks := &book.Levels[orderbook.Asks]
+	bp, bq := bids.P[0], bids.Q[0]
+	ap, aq := asks.P[0], asks.Q[0]
+	mid := float64(bp+ap) / 2.0
+	spread := float64(ap - bp)
+	totQ := float64(bq + aq)
+	if totQ <= 0 || spread <= 0 {
+		return mid
+	}
+	imb := (float64(bq) - float64(aq)) / totQ
+	return mid + spread*0.5*math.Tanh(1.5*imb)
 }
 
 func microPrice(bp, bq, ap, aq int64) float64 {

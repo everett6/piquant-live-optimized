@@ -1,4 +1,4 @@
-//go:build linux && arm64
+//go:build linux
 
 package system
 
@@ -7,6 +7,3 @@ const pinningSupported = true
 
 // setAffinity restricts the calling thread to the CPUs in mask.
 func setAffinity(mask *uint64) error { return setAffinityErr(mask) }
-
-// MachineInfo describes the production board.
-func MachineInfo() string { return "raspberry-pi-5 (bcm2712, cortex-a76)" }

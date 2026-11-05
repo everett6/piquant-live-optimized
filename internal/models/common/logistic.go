@@ -35,10 +35,13 @@ const maxIter = 50
 func (l *Logistic) Fit(samples []Sample, idx []int) error {
 	l.Mean, l.Std = standardise(samples, idx)
 	k := len(idx)
-	w := make([]float64, k+1) // w[0] is the bias
+	if k > FeatureCount {
+		k = FeatureCount
+	}
+	var w [FeatureCount + 1]float64 // w[0] is the bias
 	var grad [FeatureCount + 1]float64
 	var hess [FeatureCount + 2][FeatureCount + 2]float64
-	row := make([]float64, k+1)
+	var row [FeatureCount + 1]float64
 	row[0] = 1
 	n := 0
 	for i := range samples {
@@ -60,6 +63,7 @@ func (l *Logistic) Fit(samples []Sample, idx []int) error {
 		w[0] = math.Log(pos / (float64(n) - pos))
 	}
 	l.Iters = 0
+	var delta [FeatureCount + 2]float64
 	for iter := 0; iter < maxIter; iter++ {
 		l.Iters++
 		grad = [FeatureCount + 1]float64{}
@@ -68,7 +72,8 @@ func (l *Logistic) Fit(samples []Sample, idx []int) error {
 			if samples[i].Y != 0 && samples[i].Y != 1 {
 				continue
 			}
-			for j, jj := range idx {
+			for j := 0; j < k; j++ {
+				jj := idx[j]
 				row[j+1] = (samples[i].X[jj] - l.Mean[jj]) / l.Std[jj]
 			}
 			var z float64
@@ -94,8 +99,7 @@ func (l *Logistic) Fit(samples []Sample, idx []int) error {
 		for j := 0; j <= k; j++ {
 			hess[j][j] += 1e-9
 		}
-		delta, ok := solveSystem(hess, k+1, grad)
-		if !ok {
+		if !solveSystemFixed(&hess, k+1, &grad, &delta) {
 			break
 		}
 		var norm float64
@@ -108,10 +112,12 @@ func (l *Logistic) Fit(samples []Sample, idx []int) error {
 		}
 	}
 	l.Bias = w[0]
-	for j, jj := range idx {
+	for j := 0; j < k; j++ {
+		jj := idx[j]
 		l.Weights[jj] = w[j+1] / l.Std[jj]
 	}
-	for _, jj := range idx {
+	for j := 0; j < k; j++ {
+		jj := idx[j]
 		l.Bias -= l.Weights[jj] * l.Mean[jj]
 	}
 	l.Fitted = true
@@ -169,10 +175,8 @@ func clamp(v, lo, hi float64) float64 {
 	return v
 }
 
-// solveSystem solves a·x = rhs by Gauss-Jordan elimination with partial
-// pivoting, on a private copy of a. n is at most FeatureCount+2, so the copy
-// is a fixed-size array rather than an allocation per step.
-func solveSystem(a [FeatureCount + 2][FeatureCount + 2]float64, n int, rhs [FeatureCount + 1]float64) ([]float64, bool) {
+// solveSystemFixed solves a·x = rhs by Gauss-Jordan elimination on a stack-allocated buffer with 0 heap allocations.
+func solveSystemFixed(a *[FeatureCount + 2][FeatureCount + 2]float64, n int, rhs *[FeatureCount + 1]float64, out *[FeatureCount + 2]float64) bool {
 	var b [FeatureCount + 2][FeatureCount + 2]float64
 	copy(b[:], a[:])
 	var y [FeatureCount + 2]float64
@@ -185,11 +189,13 @@ func solveSystem(a [FeatureCount + 2][FeatureCount + 2]float64, n int, rhs [Feat
 			}
 		}
 		if best < 1e-12 {
-			return nil, false
+			return false
 		}
-		b[col], b[pivot] = b[pivot], b[col]
-		y[col], y[pivot] = y[pivot], y[col]
-		inv := 1 / b[col][col]
+		if pivot != col {
+			b[col], b[pivot] = b[pivot], b[col]
+			y[col], y[pivot] = y[pivot], y[col]
+		}
+		inv := 1.0 / b[col][col]
 		for c := col; c < n; c++ {
 			b[col][c] *= inv
 		}
@@ -208,7 +214,18 @@ func solveSystem(a [FeatureCount + 2][FeatureCount + 2]float64, n int, rhs [Feat
 			y[row] -= f * y[col]
 		}
 	}
+	copy(out[:n], y[:n])
+	return true
+}
+
+// solveSystem solves a·x = rhs by Gauss-Jordan elimination with partial
+// pivoting. Retained for backward compatibility.
+func solveSystem(a [FeatureCount + 2][FeatureCount + 2]float64, n int, rhs [FeatureCount + 1]float64) ([]float64, bool) {
+	var outFixed [FeatureCount + 2]float64
+	if !solveSystemFixed(&a, n, &rhs, &outFixed) {
+		return nil, false
+	}
 	out := make([]float64, n)
-	copy(out, y[:n])
+	copy(out, outFixed[:n])
 	return out, true
 }

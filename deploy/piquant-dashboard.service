@@ -1,0 +1,29 @@
+[Unit]
+Description=PiQuant Dashboard & Telemetry Service (Raspberry Pi 3B)
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+Documentation=https://github.com/everett6/PiQuant
+
+[Service]
+Type=simple
+User=piquant
+Group=piquant
+WorkingDirectory=/var/lib/piquant
+ExecStart=/usr/local/bin/piquant dashboard --addr :8080 --data /var/lib/piquant/data --log-dir /var/log/piquant --secrets-dir /etc/piquant
+Restart=always
+RestartSec=3s
+
+# Resource bounds for Raspberry Pi 3B (1 GB RAM target)
+MemoryHigh=380M
+MemoryMax=500M
+CPUQuota=85%
+
+# Security sandbox
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/piquant /var/log/piquant /etc/piquant
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

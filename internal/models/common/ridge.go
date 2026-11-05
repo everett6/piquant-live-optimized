@@ -33,8 +33,13 @@ func NewRidge(lam float64) *Ridge {
 
 // design rows are (x, y) pairs; features listed in idx are used.
 type Sample struct {
-	X [FeatureCount]float64
-	Y float64
+	X         [FeatureCount]float64
+	Y         float64
+	TsNs      int64
+	Mid       float64
+	Spread    float64
+	Vol       float64
+	TargetCls int64
 }
 
 // Standardise computes the training mean and standard deviation per feature.
@@ -71,23 +76,35 @@ func (r *Ridge) Fit(samples []Sample, idx []int) error {
 	r.Standardise(samples, idx)
 	// Solve only over the used features to keep the system small.
 	k := len(idx)
-	a := make([][FeatureCount + 1]float64, k+1)
+	if k > FeatureCount {
+		k = FeatureCount
+	}
+	// Fixed-size stack array eliminates heap allocations entirely.
+	var a [FeatureCount + 1][FeatureCount + 1]float64
 	n := float64(len(samples))
 	var row [FeatureCount]float64
 	// Row 0 carries the bias (unpenalised), rows 1..k the features.
 	a[0][0] = n
 	for s := range samples {
-		for j, jj := range idx {
+		for j := 0; j < k; j++ {
+			jj := idx[j]
 			row[j] = (samples[s].X[jj] - r.Mean[jj]) / r.Std[jj]
 		}
 		y := samples[s].Y
 		a[0][FeatureCount] += y
 		for j := 0; j < k; j++ {
-			for l := 0; l < k; l++ {
-				a[j+1][l+1] += row[j] * row[l]
+			rj := row[j]
+			a[j+1][0] += rj
+			a[j+1][FeatureCount] += rj * y
+			for l := j; l < k; l++ {
+				a[j+1][l+1] += rj * row[l]
 			}
-			a[j+1][0] += row[j]
-			a[j+1][FeatureCount] += row[j] * y
+		}
+	}
+	// Symmetrize the feature matrix
+	for j := 0; j < k; j++ {
+		for l := j + 1; l < k; l++ {
+			a[l+1][j+1] = a[j+1][l+1]
 		}
 	}
 	// Bias row: the sum of the features is generally non-zero once the data
@@ -98,20 +115,61 @@ func (r *Ridge) Fit(samples []Sample, idx []int) error {
 	for j := 1; j <= k; j++ {
 		a[j][j] += r.Lam
 	}
-	coef, ok := solve(a[:k+1], k+1, FeatureCount)
-	if !ok {
+	var coef [FeatureCount + 1]float64
+	if !solveFixed(&a, k+1, FeatureCount, &coef) {
 		return ErrNotFitted
 	}
 	r.Bias = coef[0]
-	for j, jj := range idx {
+	for j := 0; j < k; j++ {
+		jj := idx[j]
 		r.Weights[jj] = coef[j+1] / r.Std[jj]
 	}
 	// Fold the standardisation into the intercept so Predict needs no mean.
-	for _, jj := range idx {
+	for j := 0; j < k; j++ {
+		jj := idx[j]
 		r.Bias -= r.Weights[jj] * r.Mean[jj]
 	}
 	r.Fitted = true
 	return nil
+}
+
+// solveFixed performs Gauss-Jordan elimination on a stack-allocated matrix in place with zero heap allocations.
+func solveFixed(a *[FeatureCount + 1][FeatureCount + 1]float64, n, rhsCol int, out *[FeatureCount + 1]float64) bool {
+	for col := 0; col < n; col++ {
+		pivot := col
+		best := math.Abs(a[col][col])
+		for row := col + 1; row < n; row++ {
+			if v := math.Abs(a[row][col]); v > best {
+				best, pivot = v, row
+			}
+		}
+		if best < 1e-12 {
+			return false
+		}
+		if pivot != col {
+			a[col], a[pivot] = a[pivot], a[col]
+		}
+		inv := 1.0 / a[col][col]
+		for c := col; c <= rhsCol; c++ {
+			a[col][c] *= inv
+		}
+		for row := 0; row < n; row++ {
+			if row == col {
+				continue
+			}
+			f := a[row][col]
+			if f == 0 {
+				continue
+			}
+			for c := col; c <= rhsCol; c++ {
+				a[row][c] -= f * a[col][c]
+			}
+		}
+	}
+	for i := 0; i < n; i++ {
+		out[i] = a[i][rhsCol]
+	}
+	return true
 }
 
 // Predict returns the fitted value for one feature vector.
@@ -134,40 +192,17 @@ func (r *Ridge) Coefs(idx []int) map[int]float64 {
 
 // solve performs Gauss-Jordan elimination with partial pivoting on the
 // augmented system a (n rows, width cols, last column is the right-hand side).
-// It reports false for a singular system.
+// Retained for backward compatibility with external calls and tests.
 func solve(a [][FeatureCount + 1]float64, n, rhsCol int) ([]float64, bool) {
-	for col := 0; col < n; col++ {
-		pivot := col
-		best := math.Abs(a[col][col])
-		for row := col + 1; row < n; row++ {
-			if v := math.Abs(a[row][col]); v > best {
-				best, pivot = v, row
-			}
-		}
-		if best < 1e-12 {
-			return nil, false
-		}
-		a[col], a[pivot] = a[pivot], a[col]
-		inv := 1 / a[col][col]
-		for c := col; c <= rhsCol; c++ {
-			a[col][c] *= inv
-		}
-		for row := 0; row < n; row++ {
-			if row == col {
-				continue
-			}
-			f := a[row][col]
-			if f == 0 {
-				continue
-			}
-			for c := col; c <= rhsCol; c++ {
-				a[row][c] -= f * a[col][c]
-			}
-		}
+	var aFixed [FeatureCount + 1][FeatureCount + 1]float64
+	for i := 0; i < n && i <= FeatureCount; i++ {
+		copy(aFixed[i][:], a[i][:])
+	}
+	var outFixed [FeatureCount + 1]float64
+	if !solveFixed(&aFixed, n, rhsCol, &outFixed) {
+		return nil, false
 	}
 	out := make([]float64, n)
-	for i := 0; i < n; i++ {
-		out[i] = a[i][rhsCol]
-	}
+	copy(out, outFixed[:n])
 	return out, true
 }
