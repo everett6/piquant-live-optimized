@@ -16,6 +16,7 @@ import (
 //	\delta^{a*}, \delta^{b*} = \frac{1}{\gamma} \ln(1 + \frac{\gamma}{\kappa}) + \frac{2q \pm 1}{2} \sqrt{\frac{\sigma^2 \gamma}{2 \kappa} + \frac{\phi}{\kappa}}
 //
 // All methods execute in 0 B/op and 0 allocs/op.
+// Layout is exactly 64 bytes (8 * float64), fitting entirely into a single Cortex-A76 L1 cache line.
 type CarteaJaimungalMM struct {
 	Gamma       float64 // Absolute risk aversion \gamma
 	Kappa       float64 // Order book liquidity intensity parameter \kappa

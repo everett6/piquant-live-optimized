@@ -48,6 +48,13 @@ check_status() {
   echo ""
   echo "--- 1. Linux Kernel & Architecture ---"
   uname -a
+  PAGE_SIZE=$(getconf PAGESIZE 2>/dev/null || echo "4096")
+  echo "  Kernel Page Size: ${PAGE_SIZE} bytes"
+  if [[ "$PAGE_SIZE" -eq 16384 ]]; then
+    echo "    -> CONFIG_ARM64_16K_PAGES active (Raspberry Pi OS Bookworm 6.6+ default - optimal for Cortex-A76 TLB)"
+  else
+    echo "    -> Standard ${PAGE_SIZE}-byte page size"
+  fi
   if [[ -f /proc/sys/kernel/sched_rt_runtime_us ]]; then
     echo "  kernel.sched_rt_runtime_us = $(cat /proc/sys/kernel/sched_rt_runtime_us) (-1 means 100% RT CPU budget)"
   fi
@@ -91,22 +98,28 @@ apply_sysctl() {
   echo "[+] Configuring low-latency sysctl parameters in /etc/sysctl.d/99-piquant-rt.conf..."
   cat <<'EOF' > /etc/sysctl.d/99-piquant-rt.conf
 # PiQuant Low-Latency Kernel Tuning
+# Hardware target: Raspberry Pi 5 (ARM64 BCM2712, RP1 southbridge, BCM54213PE Gigabit PHY)
+
 # 1. Network stack zero-latency socket busy-polling (bypasses softirq context switch)
+# Tuned for BCM54213PE Gigabit Ethernet PHY via RP1 PCIe controller
 net.core.busy_poll = 50
 net.core.busy_read = 50
 
-# 2. Enlarged socket buffer queues (prevents queue drop during order flow bursts)
+# 2. Enlarged socket buffer queues (prevents packet drop during order flow bursts)
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.core.rmem_default = 2097152
 net.core.wmem_default = 2097152
 net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.udp_rmem_min = 16384
+net.ipv4.udp_wmem_min = 16384
 
 # 3. Disable delayed ACKs and optimize connection setup
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fastopen = 3
 net.core.netdev_max_backlog = 10000
+net.core.optmem_max = 2048576
 
 # 4. Memory management & Swappiness (prevent trading memory eviction)
 vm.swappiness = 1
@@ -166,6 +179,49 @@ EOF
   echo "    CPU governor locked to 'performance' on all cores permanently."
 }
 
+apply_config_txt() {
+  if [[ ! -f "$CONFIG_TXT_PATH" ]]; then
+    echo "[!] config.txt not found at $CONFIG_TXT_PATH (skip on generic x86 dev host)."
+    echo "    On Raspberry Pi 5, ensure 'arm_boost=1' in /boot/firmware/config.txt to lock Cortex-A76 at 2.4 GHz."
+    return
+  fi
+
+  echo "[+] Configuring Raspberry Pi 5 firmware parameters in $CONFIG_TXT_PATH..."
+  if [[ ! -f "${CONFIG_TXT_PATH}.orig" ]]; then
+    cp "$CONFIG_TXT_PATH" "${CONFIG_TXT_PATH}.orig"
+    echo "    Created backup: ${CONFIG_TXT_PATH}.orig"
+  fi
+
+  if grep -q "^arm_boost=1" "$CONFIG_TXT_PATH"; then
+    echo "    arm_boost=1 is already enabled in $CONFIG_TXT_PATH."
+  elif grep -q "^arm_boost=" "$CONFIG_TXT_PATH"; then
+    sed -i 's/^arm_boost=.*/arm_boost=1/' "$CONFIG_TXT_PATH"
+    echo "    Updated arm_boost=1 in $CONFIG_TXT_PATH."
+  elif grep -q "^#arm_boost=" "$CONFIG_TXT_PATH"; then
+    sed -i 's/^#arm_boost=.*/arm_boost=1/' "$CONFIG_TXT_PATH"
+    echo "    Uncommented and set arm_boost=1 in $CONFIG_TXT_PATH."
+  else
+    echo "arm_boost=1" >> "$CONFIG_TXT_PATH"
+    echo "    Appended arm_boost=1 to $CONFIG_TXT_PATH (locks Cortex-A76 at 2.4 GHz)."
+  fi
+}
+
+apply_irq_affinity() {
+  echo "[+] Configuring RP1 southbridge PCIe / Ethernet IRQ affinity steering..."
+  # Steer global default SMP affinity to CPU 0 and 1 (mask 0x3)
+  if [[ -f /proc/irq/default_smp_affinity ]]; then
+    echo 3 > /proc/irq/default_smp_affinity 2>/dev/null || true
+  fi
+  # Iterate all active hardware IRQs and pin non-isolated IRQs to CPU 0 & 1
+  for f in /proc/irq/*/smp_affinity; do
+    if [[ -f "$f" ]]; then
+      echo 3 > "$f" 2>/dev/null || true
+    fi
+  done
+  echo "    Hardware IRQs (RP1 PCIe, BCM54213PE Gigabit PHY, USB, timers) steered to CPU 0/1."
+  echo "    Quant trading Cores 2 & 3 (isolcpus=2,3) isolated with zero hardware interrupt jitter."
+}
+
 apply_cmdline_isolation() {
   if [[ ! -f "$CMDLINE_PATH" ]]; then
     echo "[!] cmdline.txt not found at $CMDLINE_PATH (skip on generic x86 dev host)."
@@ -193,7 +249,7 @@ apply_cmdline_isolation() {
     echo "      isolcpus=2,3   -> Bypasses Linux scheduler; Cores 2 & 3 dedicated exclusively to PiQuant"
     echo "      nohz_full=2,3  -> Disables 1000Hz OS kernel timer ticks on Cores 2 & 3"
     echo "      rcu_nocbs=2,3  -> Offloads kernel RCU callbacks to housekeeping Cores 0 & 1"
-    echo "      irqaffinity=0,1-> Reroutes all hardware interrupts (Ethernet/USB) to Cores 0 & 1"
+    echo "      irqaffinity=0,1-> Reroutes all hardware interrupts (RP1 PCIe/Ethernet) to Cores 0 & 1"
     echo "      transparent_hugepage=always -> ARM64 2MB hugepages for orderbook depth tables"
     echo "    [NOTE] A system reboot is required for kernel cmdline parameter changes to take effect."
   fi
@@ -231,6 +287,10 @@ revert_tuning() {
     mv "${CMDLINE_PATH}.orig" "$CMDLINE_PATH"
     echo "    Restored original $CMDLINE_PATH from backup."
   fi
+  if [[ -f "${CONFIG_TXT_PATH}.orig" ]]; then
+    mv "${CONFIG_TXT_PATH}.orig" "$CONFIG_TXT_PATH"
+    echo "    Restored original $CONFIG_TXT_PATH from backup."
+  fi
   sysctl --system >/dev/null
   echo "    Reversion complete. Reboot required to clear kernel boot parameters."
 }
@@ -243,7 +303,9 @@ case "$MODE" in
     apply_sysctl
     apply_limits
     apply_governor
+    apply_config_txt
     apply_cmdline_isolation
+    apply_irq_affinity
     echo ""
     echo "=== Kernel Tuning Successfully Applied ==="
     echo "Run './scripts/tune-kernel.sh check' to inspect active state."

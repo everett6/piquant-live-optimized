@@ -39,6 +39,35 @@ func ReadDisk(path string) (Disk, bool) {
 	return d, true
 }
 
+// ReadThermalZone reads a Linux thermal sysfs endpoint (e.g. /sys/class/thermal/thermal_zone0/temp),
+// which reports temperature in millidegrees Celsius, and converts it to degrees Celsius.
+func ReadThermalZone(path string) (float64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	s := strings.TrimSpace(string(b))
+	milli, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return float64(milli) / 1000.0, true
+}
+
+// ReadGetThrottled reads and decodes the Raspberry Pi firmware throttling bitmask from sysfs.
+func ReadGetThrottled(path string) (Throttle, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Throttle{}, false
+	}
+	s := strings.TrimSpace(string(b))
+	v, err := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 32)
+	if err != nil {
+		return Throttle{}, false
+	}
+	return DecodeThrottle(uint32(v)), true
+}
+
 // cpuBusy reads the aggregate "cpu" line of /proc/stat.
 func (c *Collector) cpuBusy() (cpuTimes, bool) {
 	b, err := os.ReadFile(c.path("proc", "stat"))

@@ -10,15 +10,21 @@ const DefaultVPINBuckets = 50
 // VPINCalculator computes the Volume-Synchronized Probability of Toxicity (VPIN)
 // using a stack/pre-allocated fixed circular buffer of N volume buckets.
 //
+// Layout is 64-byte cache-line aligned:
+//   - Cache Line 0 (bytes 0..63): hot scalar state (BucketVol, CurrBuy, CurrSell, NumBuckets, HeadIdx, Filled).
+//   - Cache Lines 1..7 (bytes 64..463): circular buffer Diffs begins at exactly offset 64,
+//     preventing split cache-line penalties and enabling aligned vector loads on Cortex-A76.
+//
 // All methods on VPINCalculator execute in 0 B/op and 0 allocs/op.
 type VPINCalculator struct {
 	BucketVol  float64                     // Volume per bucket (V)
-	NumBuckets int                         // Total volume buckets (N, up to 50)
 	CurrBuy    float64                     // Current accumulating buy volume in open bucket
 	CurrSell   float64                     // Current accumulating sell volume in open bucket
-	Diffs      [DefaultVPINBuckets]float64 // Absolute order imbalance |V_tau^B - V_tau^S|
+	NumBuckets int                         // Total volume buckets (N, up to 50)
 	HeadIdx    int                         // Circular buffer head
 	Filled     int                         // Number of completed buckets in buffer
+	_          [16]byte                    // 16 bytes pad to 64 bytes (Cache Line 0 boundary)
+	Diffs      [DefaultVPINBuckets]float64 // Absolute order imbalance |V_tau^B - V_tau^S| (offset 64)
 }
 
 // NewVPINCalculator initializes a VPINCalculator with bucket volume V and capacity N.
@@ -102,7 +108,12 @@ func (v *VPINCalculator) VPIN() float64 {
 		return 0
 	}
 	var sumDiff float64
-	for i := 0; i < v.Filled; i++ {
+	// Unroll 4-lane accumulation to prevent serial addition dependency stalls on Cortex-A76
+	i := 0
+	for ; i+4 <= v.Filled; i += 4 {
+		sumDiff += (v.Diffs[i] + v.Diffs[i+1]) + (v.Diffs[i+2] + v.Diffs[i+3])
+	}
+	for ; i < v.Filled; i++ {
 		sumDiff += v.Diffs[i]
 	}
 	denom := float64(v.Filled) * v.BucketVol

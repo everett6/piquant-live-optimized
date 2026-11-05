@@ -19,6 +19,12 @@ const SignatureTermCount = 6
 //   - x[11]:   ret_1s_bps / Hawkes arrival velocity intensity
 //   - x[13]:   trade_imb_5s
 func ComputeLevyAreaFeatures(x [FeatureCount]float64) [SignatureTermCount]float64 {
+	return ComputeLevyAreaFeaturesPtr(&x)
+}
+
+// ComputeLevyAreaFeaturesPtr calculates Depth-2 path signatures directly from a pointer
+// to avoid copying 128 bytes onto the stack on hot inference loops.
+func ComputeLevyAreaFeaturesPtr(x *[FeatureCount]float64) [SignatureTermCount]float64 {
 	// Multi-level OFI / book slope trajectory increments
 	dImbTouch := x[0] - x[1] // L1 vs L5 slope increment
 	dImbDeep := x[1] - x[2]  // L5 vs L20 slope increment
@@ -176,12 +182,11 @@ func (m *RoughSignatureOFIModel) Predict(x *[FeatureCount]float64) float64 {
 		return 0
 	}
 	base := m.BaseRidge.Predict(x)
-	sig := ComputeLevyAreaFeatures(*x)
+	sig := ComputeLevyAreaFeaturesPtr(x)
 
-	var sigContrib float64
-	for k := 0; k < SignatureTermCount; k++ {
-		sigContrib += m.SigWeights[k] * (sig[k] - m.SigMean[k])
-	}
+	// Cortex-A76 dual-issue vector floating point unrolled sum (2 x 3-lane parallel accumulation)
+	sigContrib := (m.SigWeights[0]*(sig[0]-m.SigMean[0]) + m.SigWeights[1]*(sig[1]-m.SigMean[1]) + m.SigWeights[2]*(sig[2]-m.SigMean[2])) +
+		(m.SigWeights[3]*(sig[3]-m.SigMean[3]) + m.SigWeights[4]*(sig[4]-m.SigMean[4]) + m.SigWeights[5]*(sig[5]-m.SigMean[5]))
 
 	// Dynamic Kyle's Lambda impact damping: when instantaneous price impact per unit flow
 	// indicates a depleted/illiquid book (\lambda_{Kyle} >> KyleMean), dampen raw extrapolation

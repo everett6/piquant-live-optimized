@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -52,7 +53,20 @@ type Throttle struct {
 	FreqCapped    bool   `json:"freq_capped"`
 	Throttled     bool   `json:"throttled"`
 	SoftTempLimit bool   `json:"soft_temp_limit"`
-	Raw           uint32 `json:"raw"`
+
+	// Active flags (current instant, bits 0-3):
+	ActiveUnderVoltage  bool `json:"active_under_voltage"`   // Bit 0: Under-voltage detected right now
+	ActiveFreqCapped    bool `json:"active_freq_capped"`     // Bit 1: ARM frequency capped right now
+	ActiveThrottled     bool `json:"active_throttled"`       // Bit 2: Currently throttled (active thermal throttle at 80°C / 85°C)
+	ActiveSoftTempLimit bool `json:"active_soft_temp_limit"` // Bit 3: Soft temperature limit active right now
+
+	// Historical occurrences since boot (bits 16-19):
+	HistoricalUnderVoltage  bool `json:"historical_under_voltage"`   // Bit 16: Under-voltage has occurred since boot
+	HistoricalFreqCapped    bool `json:"historical_freq_capped"`     // Bit 17: ARM frequency capped has occurred since boot
+	HistoricalThrottled     bool `json:"historical_throttled"`       // Bit 18: Throttling has occurred since boot
+	HistoricalSoftTempLimit bool `json:"historical_soft_temp_limit"` // Bit 19: Soft temperature limit has occurred since boot
+
+	Raw uint32 `json:"raw"`
 }
 
 // Disk is the free space of one filesystem the process writes to.
@@ -215,8 +229,8 @@ func (c *Collector) host(now time.Time) Host {
 }
 
 // temperature returns the SoC temperature in Celsius. Raspberry Pi boards
-// expose it under thermal_zone0; a PC usually does not, and the value stays
-// unavailable there rather than being reported as zero.
+// expose it under thermal_zone0 (in millidegrees Celsius); a PC usually does not,
+// and the value stays unavailable there rather than being reported as zero.
 func (c *Collector) temperature() (float64, bool) {
 	base := c.path("sys", "class", "thermal", "thermal_zone0")
 	s := readTrim(filepath.Join(base, "temp"))
@@ -228,9 +242,11 @@ func (c *Collector) temperature() (float64, bool) {
 		}
 		for _, e := range entries {
 			name := readTrim(c.path("sys", "class", "thermal", e.Name(), "type"))
-			if name == "cpu-thermal" || name == "soc-thermal" {
+			if name == "cpu-thermal" || name == "soc-thermal" || name == "bcm2712_thermal" || name == "rp1_thermal" || strings.Contains(name, "thermal") {
 				s = readTrim(c.path("sys", "class", "thermal", e.Name(), "temp"))
-				break
+				if s != "" {
+					break
+				}
 			}
 		}
 	}
@@ -246,6 +262,8 @@ func (c *Collector) throttle() Throttle {
 	for _, p := range []string{
 		filepath.Join("sys", "devices", "platform", "soc", "soc:firmware", "get_throttled"),
 		filepath.Join("sys", "class", "hwmon", "hwmon0", "throttled"),
+		filepath.Join("sys", "class", "hwmon", "hwmon1", "throttled"),
+		filepath.Join("sys", "class", "hwmon", "hwmon2", "throttled"),
 	} {
 		s := readTrim(c.path(p))
 		if s == "" {
@@ -257,19 +275,51 @@ func (c *Collector) throttle() Throttle {
 		}
 		return DecodeThrottle(uint32(v))
 	}
+	// Fallback to vcgencmd get_throttled on Raspberry Pi OS when running on live host
+	if c.Root == "" {
+		if vcgencmd, err := exec.LookPath("vcgencmd"); err == nil {
+			if out, err := exec.Command(vcgencmd, "get_throttled").Output(); err == nil {
+				s := strings.TrimSpace(string(out))
+				if strings.HasPrefix(s, "throttled=") {
+					s = strings.TrimPrefix(s, "throttled=")
+					if v, err := strconv.ParseUint(strings.TrimPrefix(s, "0x"), 16, 32); err == nil {
+						return DecodeThrottle(uint32(v))
+					}
+				}
+			}
+		}
+	}
 	return Throttle{}
 }
 
-// DecodeThrottle maps the firmware register to readable flags. Bits 0-3 are
-// the "happened now" flags, bits 16-19 the "has happened since boot" ones.
+// DecodeThrottle maps the Raspberry Pi firmware register to human-readable flags.
+// Bits 0-3 reflect the current active state; bits 16-19 reflect historical events since boot.
+//
+// Raspberry Pi bitmask definition:
+//   - Bit 0:  Under-voltage detected
+//   - Bit 1:  ARM frequency capped
+//   - Bit 2:  Currently throttled (active thermal throttle at 80°C / 85°C)
+//   - Bit 3:  Soft temperature limit active
+//   - Bit 16: Under-voltage has occurred since boot
+//   - Bit 17: ARM frequency capping has occurred since boot
+//   - Bit 18: Throttling has occurred since boot
+//   - Bit 19: Soft temperature limit has occurred since boot
 func DecodeThrottle(raw uint32) Throttle {
 	return Throttle{
-		Available:     true,
-		Raw:           raw,
-		UnderVoltage:  raw&(1<<0|1<<16) != 0,
-		FreqCapped:    raw&(1<<1|1<<17) != 0,
-		Throttled:     raw&(1<<2|1<<18) != 0,
-		SoftTempLimit: raw&(1<<3|1<<19) != 0,
+		Available:               true,
+		Raw:                     raw,
+		UnderVoltage:            raw&(1<<0|1<<16) != 0,
+		FreqCapped:              raw&(1<<1|1<<17) != 0,
+		Throttled:               raw&(1<<2|1<<18) != 0,
+		SoftTempLimit:           raw&(1<<3|1<<19) != 0,
+		ActiveUnderVoltage:      raw&(1<<0) != 0,
+		ActiveFreqCapped:        raw&(1<<1) != 0,
+		ActiveThrottled:         raw&(1<<2) != 0,
+		ActiveSoftTempLimit:     raw&(1<<3) != 0,
+		HistoricalUnderVoltage:  raw&(1<<16) != 0,
+		HistoricalFreqCapped:    raw&(1<<17) != 0,
+		HistoricalThrottled:     raw&(1<<18) != 0,
+		HistoricalSoftTempLimit: raw&(1<<19) != 0,
 	}
 }
 

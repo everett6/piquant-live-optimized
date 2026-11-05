@@ -208,3 +208,41 @@ func BenchmarkLogisticFit(b *testing.B) {
 		}
 	}
 }
+
+func BenchmarkDot16(b *testing.B) {
+	var w, x [FeatureCount]float64
+	for i := 0; i < FeatureCount; i++ {
+		w[i] = float64(i) * 0.1
+		x[i] = float64(16-i) * 0.2
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var sink float64
+	for i := 0; i < b.N; i++ {
+		sink += Dot16(&w, &x)
+	}
+	if math.IsNaN(sink) {
+		b.Fatal("unexpected NaN")
+	}
+}
+
+func BenchmarkRidgePredict(b *testing.B) {
+	r := NewRidge(1e-3)
+	for i := 0; i < FeatureCount; i++ {
+		r.Weights[i] = float64(i) * 0.05
+	}
+	r.Bias = 1.23
+	var x [FeatureCount]float64
+	for i := 0; i < FeatureCount; i++ {
+		x[i] = float64(i) * 0.1
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	var sink float64
+	for i := 0; i < b.N; i++ {
+		sink += r.Predict(&x)
+	}
+	if math.IsNaN(sink) {
+		b.Fatal("unexpected NaN")
+	}
+}

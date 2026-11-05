@@ -149,12 +149,23 @@ func TestDecodeThrottleBits(t *testing.T) {
 		want Throttle
 	}{
 		{0x0, Throttle{Available: true}},
-		{0x1, Throttle{Available: true, UnderVoltage: true}},
-		{0x2, Throttle{Available: true, FreqCapped: true}},
-		{0x4, Throttle{Available: true, Throttled: true}},
-		{0x8, Throttle{Available: true, SoftTempLimit: true}},
-		{0x10000, Throttle{Available: true, UnderVoltage: true}},
-		{0x80000, Throttle{Available: true, SoftTempLimit: true}},
+		{0x1, Throttle{Available: true, UnderVoltage: true, ActiveUnderVoltage: true}},
+		{0x2, Throttle{Available: true, FreqCapped: true, ActiveFreqCapped: true}},
+		{0x4, Throttle{Available: true, Throttled: true, ActiveThrottled: true}},
+		{0x8, Throttle{Available: true, SoftTempLimit: true, ActiveSoftTempLimit: true}},
+		{0x10000, Throttle{Available: true, UnderVoltage: true, HistoricalUnderVoltage: true}},
+		{0x20000, Throttle{Available: true, FreqCapped: true, HistoricalFreqCapped: true}},
+		{0x40000, Throttle{Available: true, Throttled: true, HistoricalThrottled: true}},
+		{0x80000, Throttle{Available: true, SoftTempLimit: true, HistoricalSoftTempLimit: true}},
+		{0x50005, Throttle{
+			Available:               true,
+			UnderVoltage:            true,
+			Throttled:               true,
+			ActiveUnderVoltage:      true,
+			ActiveThrottled:         true,
+			HistoricalUnderVoltage:  true,
+			HistoricalThrottled:     true,
+		}},
 	} {
 		got := DecodeThrottle(tc.raw)
 		got.Raw = tc.want.Raw

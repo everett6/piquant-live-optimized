@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -75,6 +76,35 @@ type Status struct {
 	Experiments []*experiment.Experiment      `json:"experiments,omitempty"`
 	Searches    []*experiment.ParameterSearch `json:"searches,omitempty"`
 	Datasets    []experiment.DatasetMeta      `json:"datasets,omitempty"`
+	Telemetry   *TelemetrySummary             `json:"telemetry,omitempty"`
+}
+
+// TelemetrySummary exposes Raspberry Pi 5 hardware telemetry, thermal measurements,
+// and firmware throttling bitmask flags formatted for dashboard status endpoints and UI.
+type TelemetrySummary struct {
+	Hostname                string  `json:"hostname"`
+	Arch                    string  `json:"arch"`
+	Kernel                  string  `json:"kernel"`
+	Cores                   int     `json:"cores"`
+	Governor                string  `json:"governor"`
+	CPUUtilizationPct       float64 `json:"cpu_utilization_pct"`
+	MemAvailableMB          uint64  `json:"mem_available_mb"`
+	SwapUsedMB              uint64  `json:"swap_used_mb"`
+	TemperatureC            float64 `json:"temperature_c"`
+	Throttled               bool    `json:"throttled"`
+	DiskAvailableGB         uint64  `json:"disk_available_gb"`
+	UnderVoltage            bool    `json:"under_voltage"`
+	FreqCapped              bool    `json:"freq_capped"`
+	SoftTempLimit           bool    `json:"soft_temp_limit"`
+	ActiveUnderVoltage      bool    `json:"active_under_voltage"`
+	ActiveFreqCapped        bool    `json:"active_freq_capped"`
+	ActiveThrottled         bool    `json:"active_throttled"`
+	ActiveSoftTempLimit     bool    `json:"active_soft_temp_limit"`
+	HistoricalUnderVoltage  bool    `json:"historical_under_voltage"`
+	HistoricalFreqCapped    bool    `json:"historical_freq_capped"`
+	HistoricalThrottled     bool    `json:"historical_throttled"`
+	HistoricalSoftTempLimit bool    `json:"historical_soft_temp_limit"`
+	ThrottleRaw             uint32  `json:"throttle_raw"`
 }
 
 // EngineState describes the research engine's current activity on the Pi 5.
@@ -376,6 +406,44 @@ func (s *Server) Status(ctx context.Context) Status {
 		}
 	}
 
+	var diskAvailGB uint64
+	for _, d := range st.Host.Disks {
+		diskAvailGB += d.FreeBytes / (1024 * 1024 * 1024)
+	}
+	var tempC float64
+	if st.Host.TempOK && !math.IsNaN(float64(st.Host.TempC)) {
+		tempC = float64(st.Host.TempC)
+	}
+	var cpuUtil float64
+	if !math.IsNaN(float64(st.Host.CPUBusy)) {
+		cpuUtil = float64(st.Host.CPUBusy) * 100
+	}
+	st.Telemetry = &TelemetrySummary{
+		Hostname:                st.Host.Hostname,
+		Arch:                    st.Host.Arch,
+		Kernel:                  st.Host.Kernel,
+		Cores:                   st.Host.CPUs,
+		Governor:                "performance",
+		CPUUtilizationPct:       cpuUtil,
+		MemAvailableMB:          st.Host.MemAvailable / (1024 * 1024),
+		SwapUsedMB:              (st.Host.SwapTotal - st.Host.SwapFree) / (1024 * 1024),
+		TemperatureC:            tempC,
+		Throttled:               st.Host.Throttle.Throttled || st.Host.Throttle.ActiveThrottled,
+		DiskAvailableGB:         diskAvailGB,
+		UnderVoltage:            st.Host.Throttle.UnderVoltage || st.Host.Throttle.ActiveUnderVoltage,
+		FreqCapped:              st.Host.Throttle.FreqCapped || st.Host.Throttle.ActiveFreqCapped,
+		SoftTempLimit:           st.Host.Throttle.SoftTempLimit || st.Host.Throttle.ActiveSoftTempLimit,
+		ActiveUnderVoltage:      st.Host.Throttle.ActiveUnderVoltage,
+		ActiveFreqCapped:        st.Host.Throttle.ActiveFreqCapped,
+		ActiveThrottled:         st.Host.Throttle.ActiveThrottled,
+		ActiveSoftTempLimit:     st.Host.Throttle.ActiveSoftTempLimit,
+		HistoricalUnderVoltage:  st.Host.Throttle.HistoricalUnderVoltage,
+		HistoricalFreqCapped:    st.Host.Throttle.HistoricalFreqCapped,
+		HistoricalThrottled:     st.Host.Throttle.HistoricalThrottled,
+		HistoricalSoftTempLimit: st.Host.Throttle.HistoricalSoftTempLimit,
+		ThrottleRaw:             st.Host.Throttle.Raw,
+	}
+
 	st.Checks = s.checks(st)
 	return st
 }
@@ -479,17 +547,25 @@ func (s *Server) checks(st Status) []Check {
 
 func throttleDetail(t telemetry.Throttle) string {
 	var parts []string
-	if t.UnderVoltage {
-		parts = append(parts, "under-voltage")
+	if t.ActiveUnderVoltage {
+		parts = append(parts, "under-voltage (active)")
+	} else if t.HistoricalUnderVoltage || t.UnderVoltage {
+		parts = append(parts, "under-voltage (past)")
 	}
-	if t.FreqCapped {
-		parts = append(parts, "frequency capped")
+	if t.ActiveFreqCapped {
+		parts = append(parts, "frequency capped (active)")
+	} else if t.HistoricalFreqCapped || t.FreqCapped {
+		parts = append(parts, "frequency capped (past)")
 	}
-	if t.Throttled {
-		parts = append(parts, "throttled")
+	if t.ActiveThrottled {
+		parts = append(parts, "throttled (active)")
+	} else if t.HistoricalThrottled || t.Throttled {
+		parts = append(parts, "throttled (past)")
 	}
-	if t.SoftTempLimit {
-		parts = append(parts, "soft temperature limit")
+	if t.ActiveSoftTempLimit {
+		parts = append(parts, "soft temperature limit (active)")
+	} else if t.HistoricalSoftTempLimit || t.SoftTempLimit {
+		parts = append(parts, "soft temperature limit (past)")
 	}
 	if len(parts) == 0 {
 		return "healthy"
