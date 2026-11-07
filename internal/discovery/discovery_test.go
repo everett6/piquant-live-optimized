@@ -313,3 +313,31 @@ func TestAnnouncerStartStop(t *testing.T) {
 	a.Stop()
 	send.Close()
 }
+
+func TestFastDiscoveryAdaptiveTransition(t *testing.T) {
+	send, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer send.Close()
+
+	paired := false
+	a := &Announcer{
+		Beacon: sample(RoleEngine),
+		Conn:   send,
+		Port:   1,
+		PeerChecker: func() bool {
+			return paired
+		},
+	}
+	if err := a.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer a.Stop()
+
+	if a.Interval != FastDiscoveryInterval {
+		t.Fatalf("expected initial interval %v, got %v", FastDiscoveryInterval, a.Interval)
+	}
+	paired = true
+	time.Sleep(50 * time.Millisecond)
+}

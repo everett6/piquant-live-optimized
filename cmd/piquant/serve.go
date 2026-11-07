@@ -63,9 +63,10 @@ func storeToken(store *secrets.Store, name string) string {
 // startAnnouncer advertises this board so the other one finds it without an IP
 // address. A failure is reported and ignored: discovery is a convenience, not a
 // dependency.
-func startAnnouncer(role discovery.Role, port int, token, instance, app string) *discovery.Announcer {
+func startAnnouncer(role discovery.Role, port int, token, instance, app string, browser *discovery.Browser) *discovery.Announcer {
 	a := &discovery.Announcer{
-		Token: token,
+		Token:   token,
+		Browser: browser,
 		Beacon: discovery.Beacon{
 			V: discovery.Version, Role: role, ID: instance, App: app,
 			Port: port, StartedAt: time.Now().Unix(),
@@ -131,7 +132,7 @@ func runDashboard(ctx context.Context, args []string) error {
 		}
 	}
 	port := parsePort(f.addr)
-	if a := startAnnouncer(discovery.RoleDashboard, port, storeToken(store, secrets.PeerToken), instance, f.app); a != nil {
+	if a := startAnnouncer(discovery.RoleDashboard, port, storeToken(store, secrets.PeerToken), instance, f.app, browser); a != nil {
 		defer a.Stop()
 	}
 
@@ -187,7 +188,7 @@ func runAgent(ctx context.Context, args []string) error {
 		}
 	}
 	port := parsePort(f.addr)
-	if a := startAnnouncer(discovery.RoleEngine, port, storeToken(store, secrets.PeerToken), instance, f.app); a != nil {
+	if a := startAnnouncer(discovery.RoleEngine, port, storeToken(store, secrets.PeerToken), instance, f.app, browser); a != nil {
 		defer a.Stop()
 	}
 

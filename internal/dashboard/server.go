@@ -43,6 +43,7 @@ import (
 	"sync"
 	"time"
 
+	"piquant-live/internal/cluster"
 	"piquant-live/internal/discovery"
 	"piquant-live/internal/experiment"
 	"piquant-live/internal/secrets"
@@ -216,6 +217,37 @@ type Server struct {
 	lastPeerStatus *Status
 	lastPeerFetch  time.Time
 	httpClient     *http.Client
+	probeMu        sync.RWMutex
+	probeCache     map[string]cachedProbe
+	delegator      *cluster.TaskDelegator
+}
+
+type cachedProbe struct {
+	live      bool
+	latencyMs int64
+	errStr    string
+	probedAt  time.Time
+}
+
+var sharedHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 2 * time.Second, KeepAlive: 15 * time.Second}
+			c, err := d.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := c.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
+			return c, nil
+		},
+		MaxIdleConns:        50,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     60 * time.Second,
+	},
+	Timeout: 5 * time.Second,
 }
 
 // New validates options and builds a server. It does not listen yet.
@@ -246,16 +278,33 @@ func New(opts Options) (*Server, error) {
 		mode = "simple"
 	}
 	s := &Server{
-		opts:   opts,
-		tel:    telemetry.New(opts.DataDirs...),
-		start:  opts.Now(),
-		mux:    http.NewServeMux(),
-		logger: log.New(os.Stderr, "dashboard: ", log.LstdFlags),
-		sess:   newSessionStore(opts.SessionTTL),
-		lim:    newLoginLimiter(5, 15*time.Minute),
-		mode:   mode,
+		opts:       opts,
+		tel:        telemetry.New(opts.DataDirs...),
+		start:      opts.Now(),
+		mux:        http.NewServeMux(),
+		logger:     log.New(os.Stderr, "dashboard: ", log.LstdFlags),
+		sess:       newSessionStore(opts.SessionTTL),
+		lim:        newLoginLimiter(5, 15*time.Minute),
+		mode:       mode,
+		probeCache: make(map[string]cachedProbe),
+		delegator:  cluster.NewTaskDelegator(),
+	}
+	dialer := &net.Dialer{
+		Timeout:   opts.ProbeTimeout,
+		KeepAlive: 15 * time.Second,
 	}
 	tr := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetNoDelay(true)
+			}
+			return conn, nil
+		},
 		MaxIdleConns:        100,
 		MaxIdleConnsPerHost: 20,
 		IdleConnTimeout:     90 * time.Second,
@@ -457,25 +506,77 @@ func (s *Server) peers(ctx context.Context) []PeerStatus {
 	}
 	live := s.opts.Discover.Peers()
 	out := make([]PeerStatus, 0, len(live))
+	now := s.opts.Now()
+
 	for _, p := range live {
 		row := PeerStatus{
 			Role:   p.Role,
 			Name:   p.Name,
 			Addr:   p.Addr,
 			ID:     p.ID,
-			AgeSec: p.Age(s.opts.Now()).Seconds(),
+			AgeSec: p.Age(now).Seconds(),
 			Auth:   p.Auth,
 			Live:   true,
 		}
-		// A beacon proves the announcer runs, not that the HTTP side answers.
-		probeCtx, cancel := context.WithTimeout(ctx, s.opts.ProbeTimeout)
-		start := time.Now()
-		err := probe(probeCtx, p.Endpoint()+"/api/health", s.opts.PeerToken)
-		cancel()
-		row.LatencyMs = time.Since(start).Milliseconds()
-		if err != nil {
-			row.Live, row.Error = false, err.Error()
+
+		// Check probe cache (valid for 2.5s) to eliminate blocking synchronous TCP handshakes
+		s.probeMu.RLock()
+		cached, ok := s.probeCache[p.ID]
+		s.probeMu.RUnlock()
+
+		if ok && now.Sub(cached.probedAt) < 2500*time.Millisecond {
+			row.Live = cached.live
+			row.LatencyMs = cached.latencyMs
+			row.Error = cached.errStr
+		} else {
+			probeCtx, cancel := context.WithTimeout(ctx, s.opts.ProbeTimeout)
+			start := time.Now()
+			endpoint := p.Endpoint() + "/api/health"
+			var err error
+			if s.httpClient != nil {
+				err = s.probePeer(probeCtx, endpoint, s.opts.PeerToken)
+			} else {
+				err = probe(probeCtx, endpoint, s.opts.PeerToken)
+			}
+			cancel()
+			durMs := time.Since(start).Milliseconds()
+			row.LatencyMs = durMs
+			if err != nil {
+				row.Live, row.Error = false, err.Error()
+			}
+
+			s.probeMu.Lock()
+			if s.probeCache == nil {
+				s.probeCache = make(map[string]cachedProbe)
+			}
+			s.probeCache[p.ID] = cachedProbe{
+				live:      row.Live,
+				latencyMs: row.LatencyMs,
+				errStr:    row.Error,
+				probedAt:  now,
+			}
+			s.probeMu.Unlock()
 		}
+
+		// Keep delegator synchronized with peer connectivity and RTT
+		if s.delegator != nil {
+			target := cluster.TargetPi5
+			if p.Role == discovery.RoleDashboard {
+				target = cluster.TargetPi3B
+			}
+			rttUs := float64(row.LatencyMs) * 1000.0
+			if rttUs <= 0 {
+				rttUs = 850.0
+			}
+			s.delegator.UpdateLinkStats(rttUs, 35.0, row.Live)
+			s.delegator.UpdateNodeState(target, cluster.NodeHealth{
+				Online:      row.Live,
+				CPUPermille: 320,
+				MemAvailMB:  512,
+				TempDeciC:   520,
+			})
+		}
+
 		out = append(out, row)
 	}
 	return out
@@ -582,7 +683,30 @@ func pick(cond bool, a, b string) string {
 	return b
 }
 
-// probe calls a peer's health endpoint.
+// probePeer calls a peer's health endpoint using the server's pooled HTTP client.
+func (s *Server) probePeer(ctx context.Context, url, token string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return trimErr(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		return errors.New("rejected: peer token differs")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("http %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// probe calls a peer's health endpoint using the shared pooled HTTP client.
 func probe(ctx context.Context, url, token string) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -591,8 +715,7 @@ func probe(ctx context.Context, url, token string) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 0} // the context carries the deadline
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return trimErr(err)
 	}
@@ -737,4 +860,9 @@ func (s *Server) SetClusterMode(cm string) {
 	} else {
 		s.clusterMode = "dual_pi"
 	}
+}
+
+// Delegator returns the cooperative task delegator for asymmetric cluster scheduling.
+func (s *Server) Delegator() *cluster.TaskDelegator {
+	return s.delegator
 }

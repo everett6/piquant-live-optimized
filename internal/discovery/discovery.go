@@ -66,6 +66,10 @@ const DefaultPort = 47821
 // a peer as gone, so a peer disappears from the UI within about 15 s of dying.
 const DefaultInterval = 5 * time.Second
 
+// FastDiscoveryInterval is for rapid initial startup pairing when 0 peers are known,
+// smoothly transitioning to DefaultInterval once paired.
+const FastDiscoveryInterval = 500 * time.Millisecond
+
 // DefaultTTL is how long a peer is reported after its last beacon.
 const DefaultTTL = 18 * time.Second
 
@@ -308,19 +312,22 @@ func BroadcastAddrs() []string {
 
 // Announcer periodically broadcasts this machine's beacon.
 type Announcer struct {
-	Beacon   Beacon
-	Token    string
-	Port     int           // UDP port, 0 = DefaultPort
-	Interval time.Duration // 0 = DefaultInterval
+	Beacon      Beacon
+	Token       string
+	Port        int           // UDP port, 0 = DefaultPort
+	Interval    time.Duration // 0 = adaptive (FastDiscoveryInterval until peer confirmed, then DefaultInterval)
+	Browser     *Browser      // optional: reference to browser to detect when peers are paired
+	PeerChecker func() bool   // optional: returns true when peer is detected
 
 	// Conn, when set, replaces the default connection. Tests use it to pump
 	// datagrams through a loopback socket.
 	Conn *net.UDPConn
 
-	seq  uint64
-	once sync.Once
-	stop chan struct{}
-	done chan struct{}
+	adaptive bool
+	seq      uint64
+	once     sync.Once
+	stop     chan struct{}
+	done     chan struct{}
 }
 
 // Start begins announcing. It returns immediately; Stop ends it.
@@ -332,7 +339,8 @@ func (a *Announcer) Start() error {
 		a.Port = DefaultPort
 	}
 	if a.Interval == 0 {
-		a.Interval = DefaultInterval
+		a.adaptive = true
+		a.Interval = FastDiscoveryInterval
 	}
 	a.seq = 0
 	a.stop = make(chan struct{})
@@ -366,7 +374,8 @@ func (a *Announcer) loop(conn *net.UDPConn) {
 			conn.Close()
 		}
 	}()
-	t := time.NewTicker(a.Interval)
+	currentInterval := a.Interval
+	t := time.NewTicker(currentInterval)
 	defer t.Stop()
 	a.send(conn)
 	for {
@@ -375,6 +384,24 @@ func (a *Announcer) loop(conn *net.UDPConn) {
 			return
 		case <-t.C:
 			a.send(conn)
+			if a.adaptive {
+				paired := false
+				if a.PeerChecker != nil {
+					paired = a.PeerChecker()
+				} else if a.Browser != nil {
+					paired = len(a.Browser.Peers()) > 0
+				} else if a.seq >= 6 {
+					paired = true
+				}
+				nextInterval := FastDiscoveryInterval
+				if paired {
+					nextInterval = DefaultInterval
+				}
+				if nextInterval != currentInterval {
+					currentInterval = nextInterval
+					t.Reset(currentInterval)
+				}
+			}
 		}
 	}
 }

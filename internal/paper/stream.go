@@ -6,15 +6,16 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net"
 	"net/url"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,7 +28,7 @@ import (
 // StreamConfig configures the public Binance market stream ingestor.
 type StreamConfig struct {
 	// Endpoint is the Binance WebSocket URL.
-	// Default: wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms/ethusdt@depth20@100ms/btcusdt@trade/ethusdt@trade
+	// Default: wss://stream.binance.com:9443/stream?streams=btcusdt@depth20@100ms/ethusdt@depth20@100ms/btcusdt@trade/ethusdt@trade
 	Endpoint string
 
 	// Symbols to track (default: BTCUSDT, ETHUSDT)
@@ -40,17 +41,18 @@ type StreamConfig struct {
 	ReconnectMax time.Duration
 
 	// EnableFallback enables local synthetic feed generation when offline or disconnected.
+	// Default: false for paper dry run data integrity.
 	EnableFallback bool
 }
 
 // DefaultStreamConfig returns institutional defaults for Binance public feeds.
 func DefaultStreamConfig() StreamConfig {
 	return StreamConfig{
-		Endpoint:       "wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms/ethusdt@depth20@100ms/btcusdt@trade/ethusdt@trade",
+		Endpoint:       "wss://stream.binance.com:9443/stream?streams=btcusdt@depth20@100ms/ethusdt@depth20@100ms/btcusdt@trade/ethusdt@trade",
 		Symbols:        []string{"BTCUSDT", "ETHUSDT"},
 		ReconnectBase:  500 * time.Millisecond,
 		ReconnectMax:   15 * time.Second,
-		EnableFallback: true,
+		EnableFallback: false,
 	}
 }
 
@@ -197,9 +199,44 @@ func (m *MarketStreamIngestor) runLoop(ctx context.Context) {
 
 // connectAndStream dials the public WebSocket, performs handshake, and reads frames.
 func (m *MarketStreamIngestor) connectAndStream(ctx context.Context) error {
-	u, err := url.Parse(m.cfg.Endpoint)
+	endpoints := []string{m.cfg.Endpoint}
+	// If connecting to stream.binance.com, add data-stream.binance.vision as automatic fallback
+	// if restricted (HTTP 451) from US dev locations.
+	if strings.Contains(m.cfg.Endpoint, "stream.binance.com") {
+		if u, err := url.Parse(m.cfg.Endpoint); err == nil {
+			visionURL := *u
+			visionURL.Host = "data-stream.binance.vision:9443"
+			endpoints = append(endpoints, visionURL.String())
+		}
+	}
+
+	var lastErr error
+	for _, ep := range endpoints {
+		select {
+		case <-ctx.Done():
+			return nil
+		default:
+		}
+		err := m.dialAndStreamEndpoint(ctx, ep)
+		if err == nil || ctx.Err() != nil {
+			return err
+		}
+		lastErr = err
+		// If returned 451 legal restriction, try next candidate immediately
+		if strings.Contains(err.Error(), "451") {
+			log.Printf("[MarketStreamIngestor] Endpoint %s returned HTTP 451 (geoblocked in US by Binance policy); failing over to public gateway...", ep)
+			continue
+		}
+		// On non-451 network errors, break to respect backoff
+		break
+	}
+	return lastErr
+}
+
+func (m *MarketStreamIngestor) dialAndStreamEndpoint(ctx context.Context, endpoint string) error {
+	u, err := url.Parse(endpoint)
 	if err != nil {
-		return fmt.Errorf("invalid endpoint: %w", err)
+		return fmt.Errorf("invalid endpoint %s: %w", endpoint, err)
 	}
 
 	host := u.Host
@@ -224,14 +261,14 @@ func (m *MarketStreamIngestor) connectAndStream(ctx context.Context) error {
 		conn, err = d.DialContext(dialCtx, "tcp", host)
 	}
 	if err != nil {
-		return fmt.Errorf("dial failed: %w", err)
+		return fmt.Errorf("dial failed to %s: %w", host, err)
 	}
 	defer conn.Close()
 
 	// WebSocket Client Handshake (RFC 6455)
 	wsKey := make([]byte, 16)
 	_, _ = rand.Read(wsKey)
-	keyB64 := "dGhlIHNhbXBsZSBub25jZQ==" // valid standard test key or random base64
+	keyB64 := base64.StdEncoding.EncodeToString(wsKey)
 
 	path := u.Path
 	if u.RawQuery != "" {
@@ -255,7 +292,7 @@ func (m *MarketStreamIngestor) connectAndStream(ctx context.Context) error {
 		return fmt.Errorf("handshake read status failed: %w", err)
 	}
 	if !strings.Contains(respStatus, "101") {
-		return fmt.Errorf("unexpected handshake response: %s", strings.TrimSpace(respStatus))
+		return fmt.Errorf("unexpected handshake response from %s: %s", host, strings.TrimSpace(respStatus))
 	}
 
 	// Consume remaining HTTP headers until \r\n\r\n
@@ -307,13 +344,18 @@ type binanceDepth20Payload struct {
 }
 
 // binanceTradePayload represents trade stream event.
+// Note: explicitly mapping both lowercase and uppercase keys (e/E, t/T, m/M) prevents
+// Go's encoding/json case-insensitive fallback from mistargeting string fields to int fields.
 type binanceTradePayload struct {
+	EventType string `json:"e"`
 	EventTime int64  `json:"E"`
 	Symbol    string `json:"s"`
 	TradeID   uint64 `json:"t"`
 	Price     string `json:"p"`
 	Quantity  string `json:"q"`
+	TradeTime int64  `json:"T"`
 	IsBuyerMM bool   `json:"m"`
+	Ignore    bool   `json:"M"`
 }
 
 // binanceCombinedStreamPayload wraps multi-stream payload: {"stream":"...","data":{...}}
@@ -322,87 +364,59 @@ type binanceCombinedStreamPayload struct {
 	Data   json.RawMessage `json:"data"`
 }
 
-// handleStreamPayload parses raw JSON and routes to SPSCRing.
+// handleStreamPayload parses raw JSON and routes to SPSCRing using zero-alloc fast byte parsers.
 func (m *MarketStreamIngestor) handleStreamPayload(payload []byte) {
 	nowNs := time.Now().UnixNano()
 	m.stats.LastEventNs.Store(nowNs)
 
-	// Handle combined stream wrapper if present
-	var combined binanceCombinedStreamPayload
-	var rawData []byte
-	streamName := ""
-	if err := json.Unmarshal(payload, &combined); err == nil && combined.Stream != "" {
-		streamName = combined.Stream
-		rawData = combined.Data
-	} else {
-		rawData = payload
-	}
-
-	// Route based on stream name or JSON shape
-	if strings.Contains(streamName, "@depth") || bytes.Contains(rawData, []byte(`"lastUpdateId"`)) {
-		m.handleDepthUpdate(streamName, rawData, nowNs)
-	} else if strings.Contains(streamName, "@trade") || bytes.Contains(rawData, []byte(`"e":"trade"`)) {
-		m.handleTradeUpdate(rawData, nowNs)
+	// Route based on stream name or JSON shape with zero heap allocations
+	if bytes.Contains(payload, []byte(`"trade"`)) || bytes.Contains(payload, []byte(`"e":"trade"`)) {
+		m.handleTradeUpdate(payload, nowNs)
+	} else if bytes.Contains(payload, []byte(`"depth"`)) || bytes.Contains(payload, []byte(`"lastUpdateId"`)) || bytes.Contains(payload, []byte(`"bids"`)) || bytes.Contains(payload, []byte(`"asks"`)) {
+		m.handleDepthUpdate(payload, nowNs)
 	}
 }
 
-func (m *MarketStreamIngestor) handleDepthUpdate(streamName string, data []byte, nowNs int64) {
-	var d binanceDepth20Payload
-	if err := json.Unmarshal(data, &d); err != nil {
+func (m *MarketStreamIngestor) handleDepthUpdate(payload []byte, nowNs int64) {
+	var delta marketdata.OrderBookDelta
+	if !marketdata.FastParseDepth20(payload, &delta) {
 		return
 	}
 
-	symbol := "BTCUSDT"
-	if strings.Contains(strings.ToLower(streamName), "ethusdt") {
-		symbol = "ETHUSDT"
-	}
+	symbol := marketdata.FastExtractSymbol(payload)
 
 	m.booksMu.Lock()
 	book, ok := m.books[symbol]
 	if !ok {
 		book = marketdata.NewL2OrderBook(symbol)
 		m.books[symbol] = book
+		m.symbolIDs[symbol] = uint16(len(m.symbolIDs))
 	}
 
-	// Parse bids & asks
-	nBids := len(d.Bids)
-	if nBids > marketdata.BookDepth {
-		nBids = marketdata.BookDepth
-	}
-	var bids [marketdata.BookDepth]marketdata.PriceLevel
-	for i := 0; i < nBids; i++ {
-		p, _ := strconv.ParseFloat(d.Bids[i][0], 64)
-		s, _ := strconv.ParseFloat(d.Bids[i][1], 64)
-		bids[i] = marketdata.PriceLevel{Price: p, Size: s}
-	}
-
-	nAsks := len(d.Asks)
-	if nAsks > marketdata.BookDepth {
-		nAsks = marketdata.BookDepth
-	}
-	var asks [marketdata.BookDepth]marketdata.PriceLevel
-	for i := 0; i < nAsks; i++ {
-		p, _ := strconv.ParseFloat(d.Asks[i][0], 64)
-		s, _ := strconv.ParseFloat(d.Asks[i][1], 64)
-		asks[i] = marketdata.PriceLevel{Price: p, Size: s}
-	}
-
-	// Set fresh snapshot or update
-	book.SetSnapshot(d.LastUpdateID, bids[:nBids], asks[:nAsks])
+	// Set fresh snapshot or update in-place with zero allocations
+	book.SetSnapshot(delta.FinalUpdateID(), delta.Bids, delta.Asks)
+	symID := m.symbolIDs[symbol]
 	m.booksMu.Unlock()
 
-	symID := m.symbolIDs[symbol]
 	mid, hasMid := book.MidPrice()
-	if !hasMid && nBids > 0 && nAsks > 0 {
-		mid = (bids[0].Price + asks[0].Price) * 0.5
+	if !hasMid && len(delta.Bids) > 0 && len(delta.Asks) > 0 {
+		mid = (delta.Bids[0].Price + delta.Asks[0].Price) * 0.5
+	}
+
+	var size float64
+	if len(delta.Bids) > 0 {
+		size += delta.Bids[0].Size
+	}
+	if len(delta.Asks) > 0 {
+		size += delta.Asks[0].Size
 	}
 
 	// Push to lock-free SPSC Ring
 	m.ring.Push(engine.MarketEvent{
 		Timestamp: nowNs,
-		Sequence:  d.LastUpdateID,
+		Sequence:  delta.FinalUpdateID(),
 		Price:     mid,
-		Size:      bids[0].Size + asks[0].Size,
+		Size:      size,
 		Side:      0,
 		Kind:      1, // Depth
 		SymbolID:  symID,
@@ -412,31 +426,48 @@ func (m *MarketStreamIngestor) handleDepthUpdate(streamName string, data []byte,
 	m.stats.TotalEvents.Add(1)
 }
 
-func (m *MarketStreamIngestor) handleTradeUpdate(data []byte, nowNs int64) {
-	var tr binanceTradePayload
-	if err := json.Unmarshal(data, &tr); err != nil {
+func (m *MarketStreamIngestor) handleTradeUpdate(payload []byte, nowNs int64) {
+	var (
+		symbol       string
+		price        float64
+		qty          float64
+		tradeTime    int64
+		isBuyerMaker bool
+	)
+	if !marketdata.FastParseTrade(payload, &symbol, &price, &qty, &tradeTime, &isBuyerMaker) {
 		return
 	}
-
-	p, _ := strconv.ParseFloat(tr.Price, 64)
-	q, _ := strconv.ParseFloat(tr.Quantity, 64)
-	if p <= 0 || q <= 0 {
+	if price <= 0 || qty <= 0 {
 		return
 	}
+	if symbol == "" {
+		symbol = "BTCUSDT"
+	}
 
-	symbol := strings.ToUpper(tr.Symbol)
-	symID := m.symbolIDs[symbol]
+	m.booksMu.RLock()
+	symID, ok := m.symbolIDs[symbol]
+	m.booksMu.RUnlock()
+	if !ok {
+		m.booksMu.Lock()
+		if id, exists := m.symbolIDs[symbol]; exists {
+			symID = id
+		} else {
+			symID = uint16(len(m.symbolIDs))
+			m.symbolIDs[symbol] = symID
+		}
+		m.booksMu.Unlock()
+	}
 
 	side := uint8(1) // Buy
-	if tr.IsBuyerMM {
+	if isBuyerMaker {
 		side = 2 // Sell
 	}
 
 	m.ring.Push(engine.MarketEvent{
 		Timestamp: nowNs,
-		Sequence:  tr.TradeID,
-		Price:     p,
-		Size:      q,
+		Sequence:  uint64(tradeTime),
+		Price:     price,
+		Size:      qty,
 		Side:      side,
 		Kind:      0, // Trade
 		SymbolID:  symID,
@@ -531,7 +562,7 @@ func (m *MarketStreamIngestor) updateFallbackBook(symbol string, mid float64, se
 	b.SetSnapshot(seq, bids[:], asks[:])
 }
 
-// Simple RFC 6455 frame reader (client side: server frames are unmasked).
+// Simple RFC 6455 frame reader with support for masked and unmasked frames.
 func readWSFrame(r io.Reader) ([]byte, byte, error) {
 	var header [2]byte
 	if _, err := io.ReadFull(r, header[:]); err != nil {
@@ -539,6 +570,7 @@ func readWSFrame(r io.Reader) ([]byte, byte, error) {
 	}
 
 	opcode := header[0] & 0x0F
+	isMasked := (header[1] & 0x80) != 0
 	payloadLen := int(header[1] & 0x7F)
 
 	if payloadLen == 126 {
@@ -559,9 +591,22 @@ func readWSFrame(r io.Reader) ([]byte, byte, error) {
 		return nil, 0, errors.New("frame payload exceeds 10MB limit")
 	}
 
+	var maskKey [4]byte
+	if isMasked {
+		if _, err := io.ReadFull(r, maskKey[:]); err != nil {
+			return nil, 0, err
+		}
+	}
+
 	buf := make([]byte, payloadLen)
 	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, 0, err
+	}
+
+	if isMasked {
+		for i := 0; i < payloadLen; i++ {
+			buf[i] ^= maskKey[i%4]
+		}
 	}
 
 	return buf, opcode, nil

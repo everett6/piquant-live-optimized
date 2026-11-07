@@ -7,7 +7,13 @@ bin/
 # Logs and runtime data
 *.log
 logs/
-data/
+data/*
+!data/historical/
+!data/reports/
+data/historical/ticks/*.zip
+data/historical/ticks/*.csv
+!data/historical/ticks/samples/
+!data/historical/ticks/*.pqbin
 piquant-data/
 .local/
 

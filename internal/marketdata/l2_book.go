@@ -17,11 +17,32 @@ type PriceLevel struct {
 //   - Bids: Updated bid price levels (size 0 deletes the level)
 //   - Asks: Updated ask price levels (size 0 deletes the level)
 type OrderBookDelta struct {
-	U    uint64       // firstUpdateID
-	u    uint64       // finalUpdateID
-	pu   uint64       // prevFinalUpdateID
-	Bids []PriceLevel // Updated bids
-	Asks []PriceLevel // Updated asks
+	U           uint64                // firstUpdateID
+	u           uint64                // finalUpdateID
+	pu          uint64                // prevFinalUpdateID
+	Bids        []PriceLevel          // Updated bids
+	Asks        []PriceLevel          // Updated asks
+	BidsStorage [BookDepth]PriceLevel // In-place storage for zero-alloc parsing
+	AsksStorage [BookDepth]PriceLevel // In-place storage for zero-alloc parsing
+	NumBids     int                   // Number of valid levels in BidsStorage
+	NumAsks     int                   // Number of valid levels in AsksStorage
+}
+
+// FinalUpdateID returns the final update ID of the delta.
+func (d *OrderBookDelta) FinalUpdateID() uint64 {
+	return d.u
+}
+
+// PrevUpdateID returns the previous final update ID of the delta.
+func (d *OrderBookDelta) PrevUpdateID() uint64 {
+	return d.pu
+}
+
+// SetUpdateIDs sets the sequencing IDs on the delta.
+func (d *OrderBookDelta) SetUpdateIDs(firstUpdateID, finalUpdateID, prevFinalUpdateID uint64) {
+	d.U = firstUpdateID
+	d.u = finalUpdateID
+	d.pu = prevFinalUpdateID
 }
 
 // L2OrderBook maintains an institutional sorted in-memory top-20 L2 order book

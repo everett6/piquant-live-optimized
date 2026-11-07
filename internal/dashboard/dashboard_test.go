@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"piquant-live/internal/cluster"
 	"piquant-live/internal/discovery"
 	"piquant-live/internal/secrets"
 )
@@ -598,5 +599,357 @@ func TestPWAManifestIconAndTearSheetEndpoints(t *testing.T) {
 	}
 	if _, ok := tsBody["tearsheet"].(map[string]any); !ok {
 		t.Errorf("expected tearsheet field in /api/paper/tearsheet")
+	}
+}
+
+func TestPaperBlotterL2DepthBasisHawkes(t *testing.T) {
+	srv := newTestServer(t, nil)
+	h := srv.Handler()
+
+	rec := get(t, h, http.MethodGet, "/api/paper/blotter", map[string]string{"Authorization": "Bearer " + peerToken}, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/api/paper/blotter status = %d, want 200", rec.Code)
+	}
+
+	var blotter map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &blotter); err != nil {
+		t.Fatalf("failed to decode /api/paper/blotter: %v", err)
+	}
+
+	// Verify l2_depth
+	l2Depth, ok := blotter["l2_depth"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected l2_depth in /api/paper/blotter")
+	}
+	bids, ok := l2Depth["bids"].([]any)
+	if !ok || len(bids) < 10 {
+		t.Fatalf("expected at least 10 bids in l2_depth, got %d", len(bids))
+	}
+	asks, ok := l2Depth["asks"].([]any)
+	if !ok || len(asks) < 10 {
+		t.Fatalf("expected at least 10 asks in l2_depth, got %d", len(asks))
+	}
+	resting, ok := l2Depth["resting_orders"].([]any)
+	if !ok || len(resting) < 2 {
+		t.Fatalf("expected resting maker orders in l2_depth, got %d", len(resting))
+	}
+
+	// Verify basis_arb
+	basisArb, ok := blotter["basis_arb"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected basis_arb in /api/paper/blotter")
+	}
+	if _, ok := basisArb["basis_bps"].(float64); !ok {
+		t.Errorf("expected basis_bps in basis_arb")
+	}
+	if _, ok := basisArb["z_score"].(float64); !ok {
+		t.Errorf("expected z_score in basis_arb")
+	}
+	if action, ok := basisArb["action"].(string); !ok || action == "" {
+		t.Errorf("expected action string in basis_arb")
+	}
+
+	// Verify hawkes_online
+	hawkes, ok := blotter["hawkes_online"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected hawkes_online in /api/paper/blotter")
+	}
+	if intensity, ok := hawkes["intensity"].(float64); !ok || intensity <= 0 {
+		t.Errorf("expected positive intensity in hawkes_online, got %v", hawkes["intensity"])
+	}
+	if br, ok := hawkes["branching_ratio"].(float64); !ok || br <= 0 {
+		t.Errorf("expected positive branching_ratio in hawkes_online, got %v", hawkes["branching_ratio"])
+	}
+	if _, ok := hawkes["cascade_risk"].(bool); !ok {
+		t.Errorf("expected cascade_risk bool in hawkes_online")
+	}
+
+	// Verify lead_lag_venue
+	leadLag, ok := blotter["lead_lag_venue"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected lead_lag_venue in /api/paper/blotter")
+	}
+	if leader, ok := leadLag["leader_venue"].(string); !ok || leader == "" {
+		t.Errorf("expected leader_venue in lead_lag_venue, got %v", leadLag["leader_venue"])
+	}
+	if follower, ok := leadLag["follower_venue"].(string); !ok || follower == "" {
+		t.Errorf("expected follower_venue in lead_lag_venue, got %v", leadLag["follower_venue"])
+	}
+	if _, ok := leadLag["lead_lag_spread_bps"].(float64); !ok {
+		t.Errorf("expected lead_lag_spread_bps in lead_lag_venue")
+	}
+	if _, ok := leadLag["predicted_drift_bps"].(float64); !ok {
+		t.Errorf("expected predicted_drift_bps in lead_lag_venue")
+	}
+
+	// Verify inventory_aging
+	invAging, ok := blotter["inventory_aging"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected inventory_aging in /api/paper/blotter")
+	}
+	if age, ok := invAging["holding_age_sec"].(float64); !ok || age <= 0 {
+		t.Errorf("expected positive holding_age_sec, got %v", invAging["holding_age_sec"])
+	}
+	if _, ok := invAging["decay_penalty_bps"].(float64); !ok {
+		t.Errorf("expected decay_penalty_bps in inventory_aging")
+	}
+	if state, ok := invAging["urgency_state"].(string); !ok || state == "" {
+		t.Errorf("expected urgency_state in inventory_aging, got %v", invAging["urgency_state"])
+	}
+
+	// Verify vpin enrichment
+	vpinObj, ok := blotter["vpin"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected vpin map in /api/paper/blotter, got %T", blotter["vpin"])
+	}
+	if _, ok := vpinObj["vpin"].(float64); !ok {
+		t.Errorf("expected vpin numeric value in vpin object")
+	}
+	if status, ok := vpinObj["status"].(string); !ok || (status != "NORMAL" && status != "TOXIC") {
+		t.Errorf("expected valid status ('NORMAL'/'TOXIC') in vpin object, got %v", vpinObj["status"])
+	}
+	if _, ok := vpinObj["widened_bps"].(float64); !ok {
+		t.Errorf("expected widened_bps in vpin object")
+	}
+
+	// Verify circuit_breaker enrichment
+	cbObj, ok := blotter["circuit_breaker"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected circuit_breaker map in /api/paper/blotter")
+	}
+	if state, ok := cbObj["state"].(string); !ok || state == "" {
+		t.Errorf("expected state in circuit_breaker, got %v", cbObj["state"])
+	}
+	if _, ok := cbObj["drawdown_bps"].(float64); !ok {
+		t.Errorf("expected drawdown_bps in circuit_breaker")
+	}
+	if _, ok := cbObj["peak_equity"].(float64); !ok {
+		t.Errorf("expected peak_equity in circuit_breaker")
+	}
+	if _, ok := cbObj["consecutive_losses"].(float64); !ok {
+		t.Errorf("expected consecutive_losses in circuit_breaker")
+	}
+
+	// Verify kyles_lambda enrichment
+	if kyleLam, ok := blotter["kyles_lambda"].(float64); !ok || kyleLam <= 0 {
+		t.Errorf("expected positive kyles_lambda in /api/paper/blotter, got %v", blotter["kyles_lambda"])
+	}
+
+	// Verify tca_markout enrichment
+	tcaObj, ok := blotter["tca_markout"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tca_markout map in /api/paper/blotter, got %T", blotter["tca_markout"])
+	}
+	if _, ok := tcaObj["spread_capture_bps"].(float64); !ok {
+		t.Errorf("missing spread_capture_bps in tca_markout")
+	}
+	if _, ok := tcaObj["markout_1s_bps"].(float64); !ok {
+		t.Errorf("missing markout_1s_bps in tca_markout")
+	}
+	if _, ok := tcaObj["markout_10s_bps"].(float64); !ok {
+		t.Errorf("missing markout_10s_bps in tca_markout")
+	}
+	if _, ok := tcaObj["total_fills_analyzed"].(float64); !ok {
+		t.Errorf("missing total_fills_analyzed in tca_markout")
+	}
+
+	// Verify adaptive_ensemble enrichment
+	aeObj, ok := blotter["adaptive_ensemble"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected adaptive_ensemble map in /api/paper/blotter, got %T", blotter["adaptive_ensemble"])
+	}
+	if reg, ok := aeObj["regime"].(string); !ok || reg == "" {
+		t.Errorf("missing or empty regime in adaptive_ensemble")
+	}
+	if topExp, ok := aeObj["top_expert"].(string); !ok || topExp == "" {
+		t.Errorf("missing or empty top_expert in adaptive_ensemble")
+	}
+
+	// Verify funding_carry enrichment
+	fcObj, ok := blotter["funding_carry"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected funding_carry map in /api/paper/blotter, got %T", blotter["funding_carry"])
+	}
+	if _, ok := fcObj["predicted_funding_bps"].(float64); !ok {
+		t.Errorf("missing predicted_funding_bps in funding_carry")
+	}
+	if _, ok := fcObj["annualized_apr_pct"].(float64); !ok {
+		t.Errorf("missing annualized_apr_pct in funding_carry")
+	}
+}
+
+func TestPaperReportsEndpoints(t *testing.T) {
+	s := newTestServer(t, nil)
+	authHdr := map[string]string{"Authorization": "Bearer " + peerToken}
+
+	// 1. GET /api/paper/reports
+	recList := get(t, s.Handler(), http.MethodGet, "/api/paper/reports", authHdr, nil)
+	if recList.Code != http.StatusOK {
+		t.Fatalf("/api/paper/reports status = %d: %s", recList.Code, recList.Body.String())
+	}
+	var listResp map[string]any
+	if err := json.Unmarshal(recList.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("failed to decode reports list: %v", err)
+	}
+	reports, ok := listResp["reports"].([]any)
+	if !ok || len(reports) == 0 {
+		t.Fatalf("expected non-empty reports list: %v", listResp)
+	}
+
+	// 2. GET /api/paper/reports/latest (JSON)
+	recLatest := get(t, s.Handler(), http.MethodGet, "/api/paper/reports/latest", authHdr, nil)
+	if recLatest.Code != http.StatusOK {
+		t.Fatalf("/api/paper/reports/latest status = %d: %s", recLatest.Code, recLatest.Body.String())
+	}
+	var latestResp map[string]any
+	if err := json.Unmarshal(recLatest.Body.Bytes(), &latestResp); err != nil {
+		t.Fatalf("failed to decode latest report: %v", err)
+	}
+	reportStr, ok := latestResp["report"].(string)
+	if !ok || !strings.Contains(reportStr, "PiQuant Institutional Daily Risk") {
+		t.Fatalf("unexpected latest report content: %v", latestResp)
+	}
+
+	// 3. GET /api/paper/reports/latest?format=raw (Markdown)
+	recRaw := get(t, s.Handler(), http.MethodGet, "/api/paper/reports/latest?format=raw", authHdr, nil)
+	if recRaw.Code != http.StatusOK {
+		t.Fatalf("/api/paper/reports/latest?format=raw status = %d", recRaw.Code)
+	}
+	if !strings.Contains(recRaw.Body.String(), "PiQuant Institutional Daily Risk") {
+		t.Fatalf("raw report did not contain header: %s", recRaw.Body.String())
+	}
+}
+
+func TestClusterTopologyAndEnrichedBlotter(t *testing.T) {
+	s := newTestServer(t, nil)
+	authHdr := map[string]string{"Authorization": "Bearer " + peerToken}
+
+	// 1. Initial Standalone Pi 5 Failover state (no peer connected)
+	rec := get(t, s.Handler(), http.MethodGet, "/api/cluster/topology", authHdr, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/cluster/topology returned status %d: %s", rec.Code, rec.Body.String())
+	}
+	var topo map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &topo); err != nil {
+		t.Fatalf("failed to parse /api/cluster/topology: %v", err)
+	}
+	if proto, ok := topo["link_protocol"].(string); !ok || proto != "PQLK-Binary-64B" {
+		t.Fatalf("expected link_protocol 'PQLK-Binary-64B', got %v", topo["link_protocol"])
+	}
+	if mode, ok := topo["delegation_mode"].(string); !ok || mode != "STANDALONE_PI5_FAILOVER" {
+		t.Fatalf("expected initial mode 'STANDALONE_PI5_FAILOVER', got %v", mode)
+	}
+
+	// 2. Connect Pi 3B peer and verify transition to COOPERATIVE_DUAL_PI
+	s.Delegator().UpdateNodeState(cluster.TargetPi3B, cluster.NodeHealth{
+		Online:      true,
+		CPUPermille: 300,
+		MemAvailMB:  500,
+		TempDeciC:   520,
+	})
+	s.Delegator().UpdateLinkStats(850.0, 35.0, true)
+
+	recCoop := get(t, s.Handler(), http.MethodGet, "/api/cluster/topology", authHdr, nil)
+	if recCoop.Code != http.StatusOK {
+		t.Fatalf("GET /api/cluster/topology status = %d", recCoop.Code)
+	}
+	var topoCoop map[string]any
+	if err := json.Unmarshal(recCoop.Body.Bytes(), &topoCoop); err != nil {
+		t.Fatalf("failed to parse cooperative topology: %v", err)
+	}
+	if mode, ok := topoCoop["delegation_mode"].(string); !ok || mode != "COOPERATIVE_DUAL_PI" {
+		t.Fatalf("expected cooperative mode, got %v", mode)
+	}
+	pi5Tasks, ok1 := topoCoop["pi5_tasks"].([]any)
+	pi3bTasks, ok2 := topoCoop["pi3b_delegated_tasks"].([]any)
+	if !ok1 || !ok2 || len(pi5Tasks) != 5 || len(pi3bTasks) != 5 {
+		t.Fatalf("expected 5 Pi5 tasks and 5 Pi3B tasks, got %v and %v", topoCoop["pi5_tasks"], topoCoop["pi3b_delegated_tasks"])
+	}
+
+	// 3. GET /api/paper/blotter contains enriched cluster_link
+	recBlotter := get(t, s.Handler(), http.MethodGet, "/api/paper/blotter", authHdr, nil)
+	if recBlotter.Code != http.StatusOK {
+		t.Fatalf("GET /api/paper/blotter returned status %d: %s", recBlotter.Code, recBlotter.Body.String())
+	}
+	var blotter map[string]any
+	if err := json.Unmarshal(recBlotter.Body.Bytes(), &blotter); err != nil {
+		t.Fatalf("failed to parse /api/paper/blotter: %v", err)
+	}
+	cl, ok := blotter["cluster_link"].(map[string]any)
+	if !ok {
+		t.Fatalf("blotter response missing cluster_link: %v", blotter)
+	}
+	if cl["link_protocol"] != "PQLK-Binary-64B" {
+		t.Fatalf("blotter cluster_link has wrong link_protocol: %v", cl["link_protocol"])
+	}
+	if cl["delegation_mode"] != "COOPERATIVE_DUAL_PI" {
+		t.Fatalf("blotter cluster_link expected COOPERATIVE_DUAL_PI, got %v", cl["delegation_mode"])
+	}
+}
+
+func TestHistoricalSimEndpoint(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	// 1. Unauthenticated request should be rejected
+	rec401 := get(t, s.Handler(), http.MethodGet, "/api/paper/historical-sim", nil, nil)
+	if rec401.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated GET /api/paper/historical-sim, got %d", rec401.Code)
+	}
+
+	// 2. Authenticated request
+	authHdr := map[string]string{"Authorization": "Bearer " + peerToken}
+	rec200 := get(t, s.Handler(), http.MethodGet, "/api/paper/historical-sim", authHdr, nil)
+	if rec200.Code != http.StatusOK {
+		t.Fatalf("GET /api/paper/historical-sim status = %d: %s", rec200.Code, rec200.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec200.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode historical sim JSON: %v", err)
+	}
+
+	if _, ok := payload["mode_1_full_15yr_compounded"]; !ok {
+		t.Fatalf("missing mode_1_full_15yr_compounded in payload: %v", payload)
+	}
+	if _, ok := payload["mode_2a_modern_binance_2017"]; !ok {
+		t.Fatalf("missing mode_2a_modern_binance_2017 in payload: %v", payload)
+	}
+	if _, ok := payload["mode_2b_recent_5yr_2021"]; !ok {
+		t.Fatalf("missing mode_2b_recent_5yr_2021 in payload: %v", payload)
+	}
+	if _, ok := payload["mode_3_fixed_1k_withdrawal"]; !ok {
+		t.Fatalf("missing mode_3_fixed_1k_withdrawal in payload: %v", payload)
+	}
+}
+
+func TestTickSimEndpoint(t *testing.T) {
+	s := newTestServer(t, nil)
+
+	// 1. Unauthenticated request should be rejected
+	rec401 := get(t, s.Handler(), http.MethodGet, "/api/paper/tick-sim", nil, nil)
+	if rec401.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for unauthenticated GET /api/paper/tick-sim, got %d", rec401.Code)
+	}
+
+	// 2. Authenticated request
+	authHdr := map[string]string{"Authorization": "Bearer " + peerToken}
+	rec200 := get(t, s.Handler(), http.MethodGet, "/api/paper/tick-sim", authHdr, nil)
+	if rec200.Code != http.StatusOK {
+		t.Fatalf("GET /api/paper/tick-sim status = %d: %s", rec200.Code, rec200.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec200.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode tick sim JSON: %v", err)
+	}
+
+	if payload["symbol"] != "BTCUSDT" {
+		t.Errorf("expected symbol BTCUSDT, got %v", payload["symbol"])
+	}
+	if _, ok := payload["final_equity"].(float64); !ok {
+		t.Errorf("expected final_equity in payload")
+	}
+	if _, ok := payload["monthly_breakdown"].([]any); !ok {
+		t.Errorf("expected monthly_breakdown in payload")
 	}
 }

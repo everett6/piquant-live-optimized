@@ -28,21 +28,22 @@ type RoutingDecision struct {
 }
 
 // SmartOrderRouter optimizes child order placement across passive Maker vs. immediate Taker
-// execution and across Spot vs. Perpetual Futures venues using Cont–de Larrard queue fill
-// survival probability, Kyle's lambda square-root market impact, and perpetual basis carry.
+// execution and across Spot vs. Perpetual Futures venues using Huang-Lehalle-Rosenbaum queue-reactive
+// fill survival probability (arXiv:2501.08822), Kyle's lambda square-root market impact, and perpetual basis carry.
 //
 // All methods execute in 0 B/op and 0 allocs/op.
 type SmartOrderRouter struct {
-	SpotMakerFeeBps     float64 // Spot maker fee/rebate in bps (e.g. 0.0 or -0.5 rebate)
-	SpotTakerFeeBps     float64 // Spot taker fee in bps (e.g. 4.0)
-	PerpMakerFeeBps     float64 // Perp maker fee/rebate in bps (e.g. -0.2 rebate)
-	PerpTakerFeeBps     float64 // Perp taker fee in bps (e.g. 2.5)
-	KylesLambda         float64 // Square-root price impact coefficient (bps per sqrt(unit size))
-	HalfSpreadBps       float64 // Baseline half-spread captured by passive maker orders (bps)
-	CancelRate          float64 // Cont-de Larrard queue cancellation intensity (units/sec)
-	TradeRate           float64 // Cont-de Larrard trade depletion intensity (units/sec)
-	HorizonSec          float64 // Target execution decision horizon (seconds)
-	AdverseSelectionBps float64 // Baseline post-fill maker adverse selection cost (bps)
+	SpotMakerFeeBps     float64            // Spot maker fee/rebate in bps (e.g. 0.0 or -0.5 rebate)
+	SpotTakerFeeBps     float64            // Spot taker fee in bps (e.g. 4.0)
+	PerpMakerFeeBps     float64            // Perp maker fee/rebate in bps (e.g. -0.2 rebate)
+	PerpTakerFeeBps     float64            // Perp taker fee in bps (e.g. 2.5)
+	KylesLambda         float64            // Square-root price impact coefficient (bps per sqrt(unit size))
+	HalfSpreadBps       float64            // Baseline half-spread captured by passive maker orders (bps)
+	CancelRate          float64            // Baseline cancellation intensity (units/sec)
+	TradeRate           float64            // Baseline trade depletion intensity (units/sec)
+	HorizonSec          float64            // Target execution decision horizon (seconds)
+	AdverseSelectionBps float64            // Baseline post-fill maker adverse selection cost (bps)
+	QueueModel          QueueReactiveModel // Online-estimated queue-reactive intensity model
 }
 
 // NewSmartOrderRouter returns a calibrated multi-venue SmartOrderRouter with institutional defaults.
@@ -58,6 +59,7 @@ func NewSmartOrderRouter() SmartOrderRouter {
 		TradeRate:           3.20,
 		HorizonSec:          5.0,
 		AdverseSelectionBps: 0.25,
+		QueueModel:          NewQueueReactiveModel(),
 	}
 }
 
@@ -83,14 +85,9 @@ func (s SmartOrderRouter) Route(alphaBps, orderSize, queueAhead, volatility, per
 		horizon = 5.0
 	}
 
-	// 1. Cont-de Larrard Markovian queue fill probability P(fill) within horizonSec.
-	qModel := ContDeLarrardQueue{
-		QueueAhead: queueAhead + 0.5*orderSize,
-		CancelRate: s.CancelRate,
-		TradeRate:  s.TradeRate,
-		OFI:        0.0,
-	}
-	pFill := qModel.FillProbability(horizon)
+	// 1. Huang-Lehalle-Rosenbaum queue-reactive intensity fill probability P(fill) within horizonSec.
+	effQueue := queueAhead + 0.5*orderSize
+	pFill := s.QueueModel.FillProbabilityFor(horizon, effQueue, 0.0)
 
 	// 2. Venue Selection (Spot vs. Perpetual Futures) factoring in perp basis carry & fee structure.
 	// If buying (alphaBps >= 0), a negative perpBasisBps means Perp trades at a discount (positive carry).

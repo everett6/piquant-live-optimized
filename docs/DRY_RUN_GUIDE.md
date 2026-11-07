@@ -30,8 +30,14 @@ The 14-Day Autonomous Paper Money Dry Run evaluates PiQuant's quantitative marke
 To run interactively in the foreground:
 
 ```bash
-# Standard 14-day dry run with default $100,000 USDT capital:
+# Standard 14-day dry run with default $100,000 USDT capital (pure live Binance feeds, fallback off):
 piquant dry-run
+
+# Opt-in to local synthetic fallback during network outages (paper PnL & quoting paused while offline):
+piquant dry-run --fallback
+
+# Specifying custom Binance WebSocket gateway (e.g. US or direct vision feed):
+piquant dry-run --ws-url "wss://data-stream.binance.vision:9443/stream?streams=btcusdt@depth20@100ms/ethusdt@depth20@100ms/btcusdt@trade/ethusdt@trade"
 
 # Customizing parameters:
 piquant dry-run --capital 100000 --duration-hours 336 --max-drawdown 2.0 --addr :8080
@@ -51,6 +57,8 @@ Sample output:
  PIQUANT 2-WEEK AUTONOMOUS DRY RUN STATUS REPORT
 =======================================================
  Status:          ACTIVE (OK)
+ Data Source:     live
+ Feed Down Time:  0.0s
  Progress:        Day 1 of 14 (334.8 hours remaining)
  Start Time:      2026-11-04T18:30:00Z
  Target End:      2026-11-18T18:30:00Z
@@ -68,6 +76,37 @@ Sample output:
    ETHUSDT: Size=0.5000 Entry=$3395.00 Mark=$3400.12 UnrealizedPnL=$2.56 Trades=16
 =======================================================
 ```
+
+---
+
+## 3. Data Integrity & Realistic Execution Architecture
+
+### Pure Live Feed Isolation & Fallback Policy
+1. **Default Opt-In (`--fallback=false`)**: By default, `piquant dry-run` runs strictly on live exchange feeds. If network drops occur, the engine will NOT generate synthetic ticks unless `--fallback` is explicitly provided.
+2. **PnL Freezing During Feed Down**: While in fallback mode, quoting and order fills are strictly paused, mark prices remain frozen, and cumulative offline duration is tracked under `feed_down_seconds`.
+3. **Data Source Tagging**: Every executed trade in `data/paper/dryrun_journal.jsonl`, the `/api/paper/dryrun` payload, the blotter UI banner, and CLI `--status` are explicitly tagged with `data_source = live|fallback`.
+
+### Realistic Paper Matching & Queue-Reactive Modeling
+- **Queue-Priority Fill Realism**: Replaces naive optimistic fills. A resting maker order fills only when observed market trades at or through its price deplete the preceding queue (`hftbacktest` fill realism).
+- **Latency Simulation**: Maker orders are subject to configurable network latency (`OrderLatency`, default 50ms) before participating in matching.
+- **Queue-Reactive Intensity Model**: Employs the Huang-Lehalle-Rosenbaum binned queue state model (arXiv:2501.08822) to compute continuous fill survival probabilities in `SmartOrderRouter`.
+- **Ablation Gate**: Models are screened out-of-sample after fees vs the `mlofi_ridge` baseline. Underperforming models are disabled by default in the ensemble (re-enable via `--enable-all-models`).
+
+---
+
+## 4. Raspberry Pi 5 Micro-Latency Stress Harness
+
+Evaluate full-path micro-latency (`ring -> book -> features -> models -> paper engine`) under Pi 5 hardware constraints (taskset -c 0-3, GOMAXPROCS=4, GOMEMLIMIT=2GiB) with a 4.0x Pi slowdown factor:
+
+```bash
+# Run complete stress harness across 1x (100 ev/s), 10x (1,000 ev/s), and burst (>20k ev/s)
+./scripts/pi5-stress.sh all
+
+# Or run directly via piquant CLI
+./bin/piquant bench --events 5000 --mode all
+```
+
+**Pass Criteria**: Pi 5 4x p99 latency < 1.0 ms and zero ring drops at 10x pressure.
 
 ---
 

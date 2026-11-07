@@ -54,6 +54,12 @@ func main() {
 		err = runAgent(ctx, args)
 	case "dry-run", "dryrun":
 		err = runDryRun(ctx, args)
+	case "backtest-history", "backtest":
+		err = runBacktestHistory(ctx, args)
+	case "backtest-ticks", "ticks":
+		err = runBacktestTicks(ctx, args)
+	case "bench", "stress":
+		err = runBench(ctx, args)
 	case "secrets":
 		err = runSecrets(args)
 	case "version", "-v", "--version":
@@ -81,7 +87,10 @@ func usage() {
   piquant doctor      check this board and its network peer
   piquant dashboard   serve the read-only control panel (Raspberry Pi 3B)
   piquant agent       expose engine status to the panel (Raspberry Pi 5)
-  piquant dry-run     launch 14-day autonomous paper money dry run with live public feeds
+  piquant dry-run          launch 14-day autonomous paper money dry run with live public feeds
+  piquant backtest-history run 10–15+ year historical multi-regime simulation starting at $1,000
+  piquant backtest-ticks   run 2-year microsecond monthly tick-by-tick market-making simulation
+  piquant bench            run Pi 5 architecture stress test and micro-latency benchmark
   piquant secrets     manage the local credential store
   piquant version     print build information
 

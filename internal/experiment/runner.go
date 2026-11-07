@@ -115,6 +115,68 @@ func InstantiateModel(modelName string, lambda float64, params map[string]any) C
 		return common.NewCarteaJaimungalMM(gamma, 1.5, 2.0, 0.001, 0.01, 0.5, 60.0)
 	case "esn_reservoir":
 		return &esnWrapper{mod: common.NewESNReservoirModel(lambda)}
+	case "spot_perp_basis":
+		theta := 0.65
+		if th, ok := params["theta"].(float64); ok && th > 0 {
+			theta = th
+		}
+		zThresh := 1.5
+		if z, ok := params["z_threshold"].(float64); ok && z > 0 {
+			zThresh = z
+		}
+		return common.NewSpotPerpBasisModel(lambda, theta, zThresh)
+	case "triangular_arb":
+		feeA := 2.0
+		feeB := 2.0
+		feeC := 2.0
+		thresh := 0.5
+		if fa, ok := params["fee_a_bps"].(float64); ok && fa >= 0 {
+			feeA = fa
+		}
+		if fb, ok := params["fee_b_bps"].(float64); ok && fb >= 0 {
+			feeB = fb
+		}
+		if fc, ok := params["fee_c_bps"].(float64); ok && fc >= 0 {
+			feeC = fc
+		}
+		if th, ok := params["threshold_bps"].(float64); ok && th >= 0 {
+			thresh = th
+		}
+		return common.NewTriangularArbModel(lambda, feeA, feeB, feeC, thresh)
+	case "cross_venue_leadlag":
+		venueA := "Binance"
+		venueB := "Bybit"
+		if va, ok := params["venue_a"].(string); ok && va != "" {
+			venueA = va
+		}
+		if vb, ok := params["venue_b"].(string); ok && vb != "" {
+			venueB = vb
+		}
+		return common.NewCrossVenueLeadLagModel(lambda, venueA, venueB)
+	case "vpin_toxicity":
+		threshold := 0.70
+		if t, ok := params["threshold"].(float64); ok && t > 0 {
+			threshold = t
+		}
+		return common.NewVPINToxicityModel(lambda, threshold)
+	case "kyles_lambda":
+		alpha := 0.05
+		if a, ok := params["alpha"].(float64); ok && a > 0 {
+			alpha = a
+		}
+		return common.NewKylesLambdaModel(lambda, alpha)
+	case "adaptive_meta_ensemble":
+		gamma := 0.98
+		if g, ok := params["gamma"].(float64); ok && g > 0 && g <= 1.0 {
+			gamma = g
+		}
+		eta := 0.15
+		if e, ok := params["eta"].(float64); ok && e > 0 {
+			eta = e
+		}
+		return common.NewAdaptiveMetaEnsemble(lambda, gamma, eta)
+	case "funding_carry":
+		return common.NewFundingCarryModel(lambda)
 	default:
 		return &common.Ridge{Lam: lambda}
 	}
