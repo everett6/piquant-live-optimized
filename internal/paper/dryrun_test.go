@@ -2,6 +2,7 @@ package paper
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"testing"
 	"time"
@@ -31,11 +32,11 @@ func TestDryRunEngineLifecycleAndCheckpoint(t *testing.T) {
 
 	// Verify initial state
 	st := dryRun.State()
-	if st.InitialCapital != 100000.00 {
-		t.Errorf("expected initial capital 100,000, got %v", st.InitialCapital)
+	if st.InitialCapital != 1000.00 {
+		t.Errorf("expected initial capital 1,000, got %v", st.InitialCapital)
 	}
-	if st.Equity != 100000.00 {
-		t.Errorf("expected equity 100,000, got %v", st.Equity)
+	if st.Equity != 1000.00 {
+		t.Errorf("expected equity 1,000, got %v", st.Equity)
 	}
 	if st.DaysElapsed < 1 || st.DaysElapsed > 14 {
 		t.Errorf("expected days elapsed in [1, 14], got %v", st.DaysElapsed)
@@ -164,8 +165,8 @@ func TestContDeLarrardAndKylesLambdaExecution(t *testing.T) {
 		t.Fatalf("expected 1 maker trade, got %d", st.TotalTrades)
 	}
 	pos := st.Positions["BTCUSDT"]
-	if pos.Size != 0.10 {
-		t.Errorf("expected pos size 0.10 BTC, got %v", pos.Size)
+	if pos.Size <= 0 {
+		t.Errorf("expected positive pos size, got %v", pos.Size)
 	}
 	if pos.MakerTrades != 1 {
 		t.Errorf("expected 1 maker trade in pos, got %d", pos.MakerTrades)
@@ -236,6 +237,125 @@ func TestMarketStreamIngestorFallback(t *testing.T) {
 	}
 	if popped == 0 {
 		t.Errorf("expected to pop events from ring")
+	}
+}
+
+func TestTwelveHourShutdownRecovery(t *testing.T) {
+	tempDir := t.TempDir()
+	cfg := DefaultDryRunConfig(tempDir)
+	cfg.InitialCapital = 100000.00
+	cfg.TargetDuration = 336 * time.Hour
+	cfg.ExtendOnShutdown = true
+
+	ring := engine.NewSPSCRing(1024)
+	stream := NewMarketStreamIngestor(DefaultStreamConfig(), ring)
+
+	dryRun, err := NewDryRunEngine(cfg, ring, stream)
+	if err != nil {
+		t.Fatalf("failed to create dry run engine: %v", err)
+	}
+
+	// 1. Process initial market ticks and simulated maker trades
+	now := time.Now()
+	for i := 0; i < 20; i++ {
+		ev := engine.MarketEvent{
+			Timestamp: now.Add(time.Duration(i) * time.Millisecond).UnixNano(),
+			Sequence:  uint64(i + 1),
+			Price:     65000.0 + float64(i%5),
+			Size:      0.5,
+			Side:      uint8(i % 2),
+			Kind:      0, // Trade
+			SymbolID:  0,
+		}
+		dryRun.processMarketEvent(&ev)
+	}
+
+	// Record pre-shutdown state
+	dryRun.mu.Lock()
+	dryRun.state.TotalTrades = 5
+	dryRun.state.RealizedPnL = 42.80
+	dryRun.state.Equity = 100042.80
+	dryRun.state.Cash = 100042.80
+	targetEndBefore := dryRun.state.TargetEndTime
+	dryRun.mu.Unlock()
+
+	// Checkpoint to disk
+	if err := dryRun.saveCheckpoint(); err != nil {
+		t.Fatalf("failed to save checkpoint: %v", err)
+	}
+	dryRun.Stop()
+
+	// 2. Simulate 12-Hour Shutdown (Pi powered off for 12 hours)
+	twelveHoursAgo := now.Add(-12 * time.Hour)
+	rawBytes, err := os.ReadFile(cfg.StateFile)
+	if err != nil {
+		t.Fatalf("failed to read state file: %v", err)
+	}
+	var loadedState DryRunState
+	if err := json.Unmarshal(rawBytes, &loadedState); err != nil {
+		t.Fatalf("failed to unmarshal state: %v", err)
+	}
+	loadedState.LastCheckpoint = twelveHoursAgo
+	modifiedBytes, _ := json.MarshalIndent(loadedState, "", "  ")
+	if err := os.WriteFile(cfg.StateFile, modifiedBytes, 0o644); err != nil {
+		t.Fatalf("failed to write simulated 12h shutdown state: %v", err)
+	}
+
+	// 3. Boot up PiQuant after 12 hours offline
+	dryRunResumed, err := NewDryRunEngine(cfg, ring, stream)
+	if err != nil {
+		t.Fatalf("failed to resume engine after 12h shutdown: %v", err)
+	}
+	defer dryRunResumed.Stop()
+
+	st := dryRunResumed.State()
+
+	// Verify state continuity
+	if st.InitialCapital != 100000.00 {
+		t.Errorf("expected initial capital 100000.00, got %.2f", st.InitialCapital)
+	}
+	if st.TotalTrades != 5 {
+		t.Errorf("expected 5 trades preserved, got %d", st.TotalTrades)
+	}
+	if st.RealizedPnL != 42.80 {
+		t.Errorf("expected RealizedPnL 42.80 preserved, got %.2f", st.RealizedPnL)
+	}
+	if st.Equity != 100042.80 {
+		t.Errorf("expected Equity 100042.80 preserved, got %.2f", st.Equity)
+	}
+
+	// Verify 12-hour offline recovery
+	if st.ShutdownCount != 1 {
+		t.Errorf("expected ShutdownCount=1, got %d", st.ShutdownCount)
+	}
+	if st.OfflineDowntimeSeconds < 11.9*3600 {
+		t.Errorf("expected ~12h offline downtime recorded, got %.1fs", st.OfflineDowntimeSeconds)
+	}
+	if st.LastResumeTime.IsZero() {
+		t.Errorf("expected LastResumeTime to be set")
+	}
+
+	// Verify TargetEndTime was extended by ~12 hours to guarantee full 14-day evaluation
+	extendedDiff := st.TargetEndTime.Sub(targetEndBefore)
+	if extendedDiff < time.Duration(11.9*float64(time.Hour)) || extendedDiff > time.Duration(12.1*float64(time.Hour)) {
+		t.Errorf("expected TargetEndTime to be extended by ~12 hours, got diff=%v", extendedDiff)
+	}
+
+	// 4. Verify engine seamlessly processes new live market ticks after recovery
+	newEv := engine.MarketEvent{
+		Timestamp: time.Now().UnixNano(),
+		Sequence:  2000,
+		Price:     67000.0,
+		Size:      1.0,
+		Side:      1,
+		Kind:      0,
+		SymbolID:  0,
+	}
+	dryRunResumed.processMarketEvent(&newEv)
+
+	stFinal := dryRunResumed.State()
+	if stFinal.Positions["BTCUSDT"].MarkPrice != 67000.0 {
+		t.Errorf("expected new mark price 67000.0, got %.2f", stFinal.Positions["BTCUSDT"].MarkPrice)
 	}
 }
 

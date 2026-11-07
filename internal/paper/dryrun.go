@@ -29,8 +29,11 @@ type DryRunConfig struct {
 	StateFile       string        // Path to checkpoint state (default: data/paper/dryrun_state.json)
 	JournalFile     string        // Path to trade journal (default: data/paper/dryrun_journal.jsonl)
 	CheckpointFreq  time.Duration // Interval to save state (default: 5 * time.Second)
-	OrderLatency    time.Duration // Feed + order placement latency before maker order is active (default: 50ms)
-	EnableAllModels bool          // Re-enable models disabled by ablation gate in the ensemble (default: false)
+	OrderLatency     time.Duration // Feed + order placement latency before maker order is active (default: 50ms)
+	EnableAllModels   bool          // Re-enable models disabled by ablation gate in the ensemble (default: false)
+	ExtendOnShutdown  bool          // Automatically extend target end time by offline duration upon shutdown/power-cycle recovery (default: true)
+	FlattenOnShutdown bool          // Automatically liquidate all open positions to cash at current mark price on shutdown (default: true)
+	WindowPreset      string        // Window preset: "7d" (last week), "30d" (last month), "14d" (2 weeks)
 }
 
 // DefaultDryRunConfig returns standard institutional configuration for the 2-week run.
@@ -40,17 +43,19 @@ func DefaultDryRunConfig(dataDir string) DryRunConfig {
 	}
 	paperDir := filepath.Join(dataDir, "paper")
 	return DryRunConfig{
-		InitialCapital: 100000.00,
-		TargetDuration: 14 * 24 * time.Hour,
-		Symbols:        []string{"BTCUSDT", "ETHUSDT"},
-		MaxDrawdownPct: 2.0,
-		MakerFeeBps:    0.0,
-		TakerFeeBps:    4.0,
-		KylesLambda:    0.25,
-		StateFile:      filepath.Join(paperDir, "dryrun_state.json"),
-		JournalFile:    filepath.Join(paperDir, "dryrun_journal.jsonl"),
-		CheckpointFreq: 5 * time.Second,
-		OrderLatency:   50 * time.Millisecond,
+		InitialCapital:    1000.00,
+		TargetDuration:    14 * 24 * time.Hour,
+		Symbols:           []string{"BTCUSDT", "ETHUSDT"},
+		MaxDrawdownPct:    2.0,
+		MakerFeeBps:       0.0,
+		TakerFeeBps:       4.0,
+		KylesLambda:       0.25,
+		StateFile:         filepath.Join(paperDir, "dryrun_state.json"),
+		JournalFile:       filepath.Join(paperDir, "dryrun_journal.jsonl"),
+		CheckpointFreq:    5 * time.Second,
+		OrderLatency:      50 * time.Millisecond,
+		ExtendOnShutdown:  true,
+		FlattenOnShutdown: true,
 	}
 }
 
@@ -121,10 +126,16 @@ type DryRunState struct {
 	Positions         map[string]*Position `json:"positions"`
 	DailyReturns      []float64            `json:"daily_returns"`
 	DaysElapsed       int                  `json:"days_elapsed"`
+	TargetDays        int                  `json:"target_days"`              // Total days in target evaluation window (e.g. 7, 14, 30)
+	WindowPreset      string               `json:"window_preset"`            // "7d" (last week), "30d" (last month), "14d" (2 weeks)
 	HoursRemaining    float64              `json:"hours_remaining"`
-	DataSource        string               `json:"data_source"`       // "live" or "fallback"
-	FeedDownSeconds   float64              `json:"feed_down_seconds"` // Cumulative duration market feed was disconnected
-	QuotingPaused     bool                 `json:"quoting_paused"`    // True when quoting/matching paused due to feed down
+	DataSource             string               `json:"data_source"`              // "live" or "fallback"
+	FeedDownSeconds        float64              `json:"feed_down_seconds"`        // Cumulative duration market feed was disconnected
+	QuotingPaused          bool                 `json:"quoting_paused"`           // True when quoting/matching paused due to feed down
+	OfflineDowntimeSeconds float64              `json:"offline_downtime_seconds"` // Cumulative time system was shut down / offline
+	ShutdownCount          int                  `json:"shutdown_count"`           // Number of power-cycles/resumptions survived
+	LastResumeTime         time.Time            `json:"last_resume_time"`         // Timestamp of latest recovery after shutdown
+	Leverage               DynamicLeverageState `json:"leverage"`                 // Real-time automatic dynamic leverage and regime
 }
 
 // DryRunEngine orchestrates the 14-day autonomous dry run.
@@ -153,6 +164,8 @@ type DryRunEngine struct {
 	kyleEst       *common.KylesLambdaEstimator
 	tcaTracker    *TCAMarkoutTracker
 	sor           common.SmartOrderRouter
+	hawkesEst     *common.OnlineHawkesEstimator
+	leverageCtrl  *DynamicLeverageController
 
 	// Online tick tracking
 	recentFills []TradeRecord
@@ -161,13 +174,34 @@ type DryRunEngine struct {
 	wg          sync.WaitGroup
 }
 
-// NewDryRunEngine constructs and recovers or initializes the 14-day paper trading engine.
+// NewDryRunEngine constructs and recovers or initializes the paper trading engine.
 func NewDryRunEngine(cfg DryRunConfig, ring *engine.SPSCRing, stream *MarketStreamIngestor) (*DryRunEngine, error) {
 	if cfg.InitialCapital <= 0 {
-		cfg.InitialCapital = 100000.00
+		cfg.InitialCapital = 1000.00
 	}
-	if cfg.TargetDuration <= 0 {
+	switch strings.ToLower(strings.TrimSpace(cfg.WindowPreset)) {
+	case "7d", "1w", "week", "last_week", "last-week":
+		cfg.TargetDuration = 7 * 24 * time.Hour
+		cfg.WindowPreset = "7d"
+	case "30d", "1m", "month", "last_month", "last-month":
+		cfg.TargetDuration = 30 * 24 * time.Hour
+		cfg.WindowPreset = "30d"
+	case "14d", "2w", "2week", "two_weeks":
 		cfg.TargetDuration = 14 * 24 * time.Hour
+		cfg.WindowPreset = "14d"
+	default:
+		if cfg.TargetDuration <= 0 {
+			cfg.TargetDuration = 14 * 24 * time.Hour
+		}
+		if cfg.WindowPreset == "" {
+			if cfg.TargetDuration == 7*24*time.Hour {
+				cfg.WindowPreset = "7d"
+			} else if cfg.TargetDuration == 30*24*time.Hour {
+				cfg.WindowPreset = "30d"
+			} else {
+				cfg.WindowPreset = "14d"
+			}
+		}
 	}
 	if cfg.MaxDrawdownPct <= 0 {
 		cfg.MaxDrawdownPct = 2.0
@@ -186,6 +220,10 @@ func NewDryRunEngine(cfg DryRunConfig, ring *engine.SPSCRing, stream *MarketStre
 		cfg.OrderLatency = 50 * time.Millisecond
 	}
 
+	levCfg := DefaultDynamicLeverageConfig()
+	levCfg.MaxDrawdownPct = cfg.MaxDrawdownPct
+	levCtrl := NewDynamicLeverageController(levCfg)
+
 	e := &DryRunEngine{
 		cfg:           cfg,
 		ring:          ring,
@@ -202,6 +240,8 @@ func NewDryRunEngine(cfg DryRunConfig, ring *engine.SPSCRing, stream *MarketStre
 		kyleEst:       common.NewKylesLambdaEstimator(0.05, cfg.KylesLambda),
 		tcaTracker:    NewTCAMarkoutTracker(),
 		sor:           common.NewSmartOrderRouter(),
+		hawkesEst:     common.NewOnlineHawkesEstimator(5.0, 12.0, 20.0),
+		leverageCtrl:  levCtrl,
 		activeOrders:  make(map[string][]*ActiveMakerOrder),
 		recentFills:   make([]TradeRecord, 0, 32),
 	}
@@ -210,6 +250,10 @@ func NewDryRunEngine(cfg DryRunConfig, ring *engine.SPSCRing, stream *MarketStre
 	if err := e.loadCheckpoint(); err != nil {
 		// Initialize fresh state if no checkpoint exists
 		now := time.Now()
+		targetDays := int(cfg.TargetDuration.Hours() / 24.0)
+		if targetDays <= 0 {
+			targetDays = 14
+		}
 		e.state = DryRunState{
 			StartTime:      now,
 			TargetEndTime:  now.Add(cfg.TargetDuration),
@@ -219,8 +263,11 @@ func NewDryRunEngine(cfg DryRunConfig, ring *engine.SPSCRing, stream *MarketStre
 			Equity:         cfg.InitialCapital,
 			PeakEquity:     cfg.InitialCapital,
 			Positions:      make(map[string]*Position, len(cfg.Symbols)),
-			DailyReturns:   make([]float64, 0, 14),
+			DailyReturns:   make([]float64, 0, targetDays),
+			TargetDays:     targetDays,
+			WindowPreset:   cfg.WindowPreset,
 			DataSource:     "live",
+			Leverage:       levCtrl.Compute(10.0, 0.20, 0.50, 0.0, false),
 		}
 		for _, s := range cfg.Symbols {
 			upper := strings.ToUpper(s)
@@ -231,6 +278,15 @@ func NewDryRunEngine(cfg DryRunConfig, ring *engine.SPSCRing, stream *MarketStre
 	} else {
 		if e.state.DataSource == "" {
 			e.state.DataSource = "live"
+		}
+		if e.state.TargetDays <= 0 {
+			e.state.TargetDays = int(cfg.TargetDuration.Hours() / 24.0)
+			if e.state.TargetDays <= 0 {
+				e.state.TargetDays = 14
+			}
+		}
+		if e.state.WindowPreset == "" {
+			e.state.WindowPreset = cfg.WindowPreset
 		}
 	}
 
@@ -258,13 +314,83 @@ func (e *DryRunEngine) Start(ctx context.Context) {
 	go e.runCheckpointLoop(ctx)
 }
 
-// Stop terminates the engine and checkpoints state.
+// Stop terminates the engine, cancels all resting orders, optionally auto-liquidates open inventory to cash, and checkpoints state.
 func (e *DryRunEngine) Stop() {
 	if !e.running.Swap(false) {
 		return
 	}
 	close(e.stopCh)
 	e.wg.Wait()
+
+	e.mu.Lock()
+	// 1. Cancel all resting maker orders on shutdown
+	for s := range e.activeOrders {
+		e.activeOrders[s] = nil
+	}
+
+	// 2. Auto TS (Trailing Stop / Liquidation) on Shutdown:
+	// If configured (default true), close any open inventory at current MarkPrice to convert all unrealized PnL to cash
+	if e.cfg.FlattenOnShutdown {
+		for sym, pos := range e.state.Positions {
+			if pos != nil && pos.Size != 0 && pos.MarkPrice > 0 {
+				closePrice := pos.MarkPrice
+				qty := math.Abs(pos.Size)
+				valUSDT := closePrice * qty
+				realizedPnL := 0.0
+
+				if pos.Size > 0 { // Long position liquidated
+					realizedPnL = pos.Size * (closePrice - pos.AvgEntryPrice)
+					e.state.Cash += valUSDT
+				} else { // Short position covered
+					realizedPnL = (-pos.Size) * (pos.AvgEntryPrice - closePrice)
+					e.state.Cash -= valUSDT
+				}
+
+				pos.RealizedPnL += realizedPnL
+				pos.UnrealizedPnL = 0
+				pos.Size = 0
+				pos.TotalTrades++
+
+				e.state.RealizedPnL += realizedPnL
+				e.state.TotalTrades++
+				if realizedPnL > 0 {
+					e.state.WinningTrades++
+				} else if realizedPnL < 0 {
+					e.state.LosingTrades++
+				}
+
+				// Record liquidation fill in journal/blotter
+				fillRec := TradeRecord{
+					Timestamp:   time.Now().UTC(),
+					Symbol:      sym,
+					Side:        "SHUTDOWN_AUTO_LIQUIDATE",
+					Role:        "TAKER_SAFETY",
+					Price:       closePrice,
+					Size:        qty,
+					ValueUSDT:   valUSDT,
+					FeeUSDT:     0.0,
+					EdgeBps:     0.0,
+					SlippageBps: 0.0,
+					PnLRealized: realizedPnL,
+					Strategy:    "Shutdown_Auto_TS_Flatten",
+					DataSource:  "live",
+				}
+				e.recentFills = append([]TradeRecord{fillRec}, e.recentFills...)
+				if len(e.recentFills) > 64 {
+					e.recentFills = e.recentFills[:64]
+				}
+				if e.journal != nil {
+					if b, err := json.Marshal(fillRec); err == nil {
+						_, _ = e.journal.Write(append(b, '\n'))
+					}
+				}
+			}
+		}
+		// Reset unrealized PnL and lock equity into cash
+		e.state.UnrealizedPnL = 0
+		e.state.Equity = e.state.Cash
+	}
+	e.mu.Unlock()
 
 	_ = e.saveCheckpoint()
 	if e.journal != nil {
@@ -289,15 +415,30 @@ func (e *DryRunEngine) State() DryRunState {
 	// Update computed timing fields
 	now := time.Now()
 	elapsed := now.Sub(cp.StartTime)
+	totalDays := cp.TargetDays
+	if totalDays <= 0 {
+		totalDays = int(e.cfg.TargetDuration.Hours() / 24.0)
+		if totalDays <= 0 {
+			totalDays = 14
+		}
+		cp.TargetDays = totalDays
+	}
+	if cp.WindowPreset == "" {
+		cp.WindowPreset = e.cfg.WindowPreset
+	}
 	cp.DaysElapsed = int(elapsed.Hours()/24.0) + 1
-	if cp.DaysElapsed > 14 {
-		cp.DaysElapsed = 14
+	if cp.DaysElapsed > totalDays {
+		cp.DaysElapsed = totalDays
 	}
 	remaining := cp.TargetEndTime.Sub(now)
 	if remaining < 0 {
 		remaining = 0
 	}
 	cp.HoursRemaining = remaining.Hours()
+
+	if cp.Leverage.EffectiveLeverage == 0 && e.leverageCtrl != nil {
+		cp.Leverage = e.leverageCtrl.Compute(10.0, 0.20, 0.50, 0.0, cp.CircuitHalted)
+	}
 
 	return cp
 }
@@ -309,6 +450,14 @@ func (e *DryRunEngine) RecentFills() []TradeRecord {
 	out := make([]TradeRecord, len(e.recentFills))
 	copy(out, e.recentFills)
 	return out
+}
+
+// StreamStats returns real-time event counts from the public WebSocket ingestor.
+func (e *DryRunEngine) StreamStats() (total, depths, trades, gaps, reconnects, fallbacks uint64, lastNs int64) {
+	if e.stream != nil {
+		return e.stream.Stats()
+	}
+	return 0, 0, 0, 0, 0, 0, 0
 }
 
 // runCheckpointLoop periodically persists state to dryrun_state.json.
@@ -332,18 +481,22 @@ func (e *DryRunEngine) runCheckpointLoop(ctx context.Context) {
 // saveCheckpoint serializes DryRunState to JSON.
 func (e *DryRunEngine) saveCheckpoint() error {
 	e.mu.Lock()
-	e.state.LastCheckpoint = time.Now()
 	now := time.Now()
-	elapsed := now.Sub(e.state.StartTime)
-	e.state.DaysElapsed = int(elapsed.Hours()/24.0) + 1
-	if e.state.DaysElapsed > 14 {
-		e.state.DaysElapsed = 14
+	e.state.LastCheckpoint = now
+
+	// Protect against backward time jump before NTP sync on Raspberry Pi
+	if !e.state.StartTime.IsZero() && now.After(e.state.StartTime) {
+		elapsed := now.Sub(e.state.StartTime)
+		e.state.DaysElapsed = int(elapsed.Hours()/24.0) + 1
+		if e.state.DaysElapsed > 14 {
+			e.state.DaysElapsed = 14
+		}
+		rem := e.state.TargetEndTime.Sub(now)
+		if rem < 0 {
+			rem = 0
+		}
+		e.state.HoursRemaining = rem.Hours()
 	}
-	rem := e.state.TargetEndTime.Sub(now)
-	if rem < 0 {
-		rem = 0
-	}
-	e.state.HoursRemaining = rem.Hours()
 
 	data, err := json.MarshalIndent(e.state, "", "  ")
 	e.mu.Unlock()
@@ -363,7 +516,7 @@ func (e *DryRunEngine) saveCheckpoint() error {
 	return os.Rename(tmpFile, e.cfg.StateFile)
 }
 
-// loadCheckpoint deserializes state from JSON.
+// loadCheckpoint deserializes state from JSON and handles shutdown gap recovery.
 func (e *DryRunEngine) loadCheckpoint() error {
 	if e.cfg.StateFile == "" {
 		return os.ErrNotExist
@@ -380,6 +533,35 @@ func (e *DryRunEngine) loadCheckpoint() error {
 
 	if st.Positions == nil {
 		st.Positions = make(map[string]*Position)
+	}
+
+	now := time.Now()
+	// Detect shutdown gap and recover seamlessly
+	if !st.LastCheckpoint.IsZero() {
+		if now.Before(st.LastCheckpoint) {
+			// System clock warped backwards (Raspberry Pi without RTC booted before NTP sync).
+			// Keep existing target end time and hours remaining intact until NTP catches up.
+		} else {
+			offlineGap := now.Sub(st.LastCheckpoint)
+			// If offline for more than 30s (e.g. 12-hour power-off, reboot, or transport):
+			if offlineGap > 30*time.Second {
+				st.OfflineDowntimeSeconds += offlineGap.Seconds()
+				st.FeedDownSeconds += offlineGap.Seconds()
+				st.ShutdownCount++
+				st.LastResumeTime = now
+
+				// If configured (default true), extend target end time by the offline duration
+				// so the user gets the FULL 336 hours of active live market evaluation!
+				if e.cfg.ExtendOnShutdown && !st.TargetEndTime.IsZero() {
+					st.TargetEndTime = st.TargetEndTime.Add(offlineGap)
+				}
+				rem := st.TargetEndTime.Sub(now)
+				if rem < 0 {
+					rem = 0
+				}
+				st.HoursRemaining = rem.Hours()
+			}
+		}
 	}
 
 	e.mu.Lock()
@@ -527,6 +709,9 @@ func (e *DryRunEngine) processMarketEvent(ev *engine.MarketEvent) {
 		}
 		if e.kyleEst != nil {
 			e.kyleEst.UpdateTrade(price, ev.Size, isBuyerMaker)
+		}
+		if e.hawkesEst != nil {
+			e.hawkesEst.Update(ev.Timestamp, !isBuyerMaker, ev.Size)
 		}
 		e.matchMakerOrders(symbol, price, ev.Size, ev.Side, now)
 		return
@@ -690,9 +875,22 @@ func (e *DryRunEngine) evaluateQuotesAndGating(symbol string, midPrice float64, 
 		targetAsk = midPrice + (qd.AskOffsetBps * midPrice * 1e-4)
 	}
 
-	qty := 0.10
-	if symbol == "ETHUSDT" {
-		qty = 1.0
+	// Dynamic Leverage Controller: automatic regime & exposure scaling
+	hkRatio := 0.60
+	if e.hawkesEst != nil {
+		hkRatio = e.hawkesEst.BranchingRatio()
+	}
+	ddPct := 0.0
+	if e.state.PeakEquity > 0 {
+		ddPct = (e.state.PeakEquity - e.state.Equity) / e.state.PeakEquity * 100.0
+	}
+	levState := e.leverageCtrl.Compute(spreadBps, liveVpin, hkRatio, ddPct, e.state.CircuitHalted)
+	e.state.Leverage = levState
+
+	// Dynamic institutional order sizing bounded by effective leverage and capital (symbol-specific vol parity)
+	qty := e.leverageCtrl.ComputeOrderSizeForSymbol(symbol, e.state.Equity, levState.EffectiveLeverage, midPrice, len(e.cfg.Symbols))
+	if qty <= 0 {
+		qty = 0.001
 	}
 
 	e.mu.Lock()
@@ -772,9 +970,16 @@ func (e *DryRunEngine) simulateMakerFill(symbol string, midPrice float64, qd com
 
 	side := "BUY"
 	orderPrice := midPrice - (qd.BidOffsetBps * midPrice * 1e-4)
-	qty := 0.10
-	if symbol == "ETHUSDT" {
-		qty = 1.0
+	effLev := 2.5
+	if e.state.Leverage.EffectiveLeverage > 0 {
+		effLev = e.state.Leverage.EffectiveLeverage
+	}
+	qty := 0.01
+	if e.leverageCtrl != nil && midPrice > 0 {
+		qty = e.leverageCtrl.ComputeOrderSize(e.state.Equity, effLev, midPrice, len(e.cfg.Symbols))
+	}
+	if qty <= 0 {
+		qty = 0.001
 	}
 	if qd.ReservationBps < 0 {
 		side = "SELL"
@@ -889,9 +1094,16 @@ func (e *DryRunEngine) executeMakerFillLocked(symbol string, orderPrice, qty flo
 // simulateTakerFillLocked simulates an aggressive taker order. Caller must hold e.mu.
 func (e *DryRunEngine) simulateTakerFillLocked(symbol string, midPrice float64, alphaBps float64) {
 	side := "BUY"
-	qty := 0.05
-	if symbol == "ETHUSDT" {
-		qty = 0.5
+	effLev := 2.5
+	if e.state.Leverage.EffectiveLeverage > 0 {
+		effLev = e.state.Leverage.EffectiveLeverage
+	}
+	qty := 0.005
+	if e.leverageCtrl != nil && midPrice > 0 {
+		qty = e.leverageCtrl.ComputeOrderSize(e.state.Equity, effLev*0.5, midPrice, len(e.cfg.Symbols))
+	}
+	if qty <= 0 {
+		qty = 0.001
 	}
 	if alphaBps < 0 {
 		side = "SELL"

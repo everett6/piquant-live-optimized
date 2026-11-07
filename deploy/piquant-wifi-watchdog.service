@@ -1,0 +1,16 @@
+[Unit]
+Description=PiQuant Wi-Fi Health Watchdog & Hotspot Failover Daemon
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/home/everett/PiQuant/piquant-live/scripts/wifi-watchdog.sh wlan0
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/piquant-wifi.log
+StandardError=append:/var/log/piquant-wifi.log
+
+[Install]
+WantedBy=multi-user.target

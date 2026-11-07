@@ -46,6 +46,7 @@ import (
 	"piquant-live/internal/cluster"
 	"piquant-live/internal/discovery"
 	"piquant-live/internal/experiment"
+	"piquant-live/internal/paper"
 	"piquant-live/internal/secrets"
 	"piquant-live/internal/telemetry"
 )
@@ -78,6 +79,7 @@ type Status struct {
 	Searches    []*experiment.ParameterSearch `json:"searches,omitempty"`
 	Datasets    []experiment.DatasetMeta      `json:"datasets,omitempty"`
 	Telemetry   *TelemetrySummary             `json:"telemetry,omitempty"`
+	DryRun      *paper.DryRunState            `json:"dry_run,omitempty"`
 }
 
 // TelemetrySummary exposes Raspberry Pi 5 hardware telemetry, thermal measurements,
@@ -192,6 +194,8 @@ type Options struct {
 	Manager *experiment.Manager
 	// InitialMode: "simple" (default) or "advanced".
 	Mode string
+	// ClusterMode: "pi5_only" (co-located) or "dual_pi" (asymmetric).
+	ClusterMode string
 	// DryRun, when set, exposes the 14-day autonomous paper money dry run engine.
 	DryRun any
 }
@@ -273,6 +277,17 @@ func New(opts Options) (*Server, error) {
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
+	if opts.Manager == nil && (opts.Role != discovery.RoleDashboard || opts.Discover == nil) {
+		dataDir := "data"
+		if len(opts.DataDirs) > 0 && opts.DataDirs[0] != "" {
+			dataDir = opts.DataDirs[0]
+		}
+		_ = os.MkdirAll(dataDir, 0o755)
+		_ = experiment.GenerateStandardDatasets(dataDir)
+		if mgr, err := experiment.NewManager(dataDir, nil); err == nil {
+			opts.Manager = mgr
+		}
+	}
 	mode := opts.Mode
 	if mode == "" {
 		mode = "simple"
@@ -289,6 +304,15 @@ func New(opts Options) (*Server, error) {
 		probeCache: make(map[string]cachedProbe),
 		delegator:  cluster.NewTaskDelegator(),
 	}
+	cm := opts.ClusterMode
+	if cm == "" {
+		if opts.Role == discovery.RoleEngine || opts.DryRun != nil || opts.Manager != nil {
+			cm = "pi5_only"
+		} else {
+			cm = "dual_pi"
+		}
+	}
+	s.clusterMode = cm
 	dialer := &net.Dialer{
 		Timeout:   opts.ProbeTimeout,
 		KeepAlive: 15 * time.Second,
@@ -419,6 +443,25 @@ func (s *Server) Status(ctx context.Context) Status {
 
 	if s.opts.EngineStatus != nil {
 		st.Engine = s.opts.EngineStatus()
+	}
+	if s.opts.DryRun != nil {
+		if eng, ok := s.opts.DryRun.(interface {
+			State() any
+		}); ok {
+			rawState := eng.State()
+			if drState, ok := rawState.(paper.DryRunState); ok {
+				st.DryRun = &drState
+				if !st.Engine.Running {
+					st.Engine = EngineState{
+						Running:  !drState.CircuitHalted,
+						Phase:    fmt.Sprintf("14-Day Dry Run: Day %d/14", drState.DaysElapsed),
+						Progress: float64(drState.DaysElapsed) / 14.0,
+						Message:  fmt.Sprintf("Autonomous MM: $%.2f USDT (%+.2f%% return)", drState.Equity, drState.TotalReturnPct),
+						Updated:  time.Now(),
+					}
+				}
+			}
+		}
 	}
 	if s.opts.Jobs != nil && len(st.Jobs) == 0 {
 		st.Jobs = s.opts.Jobs()
@@ -623,7 +666,8 @@ func (s *Server) checks(st Status) []Check {
 		})
 	}
 	engineLive := false
-	if s.ClusterMode() == "pi5_only" || s.opts.Role == discovery.RoleEngine {
+	isLocalEngine := s.ClusterMode() == "pi5_only" || s.opts.Role == discovery.RoleEngine || s.opts.Manager != nil || s.opts.DryRun != nil
+	if isLocalEngine {
 		engineLive = true
 	} else {
 		for _, p := range st.Peers {
@@ -632,13 +676,13 @@ func (s *Server) checks(st Status) []Check {
 			}
 		}
 	}
-	if s.opts.Discover != nil && s.ClusterMode() == "dual_pi" {
+	if s.opts.Discover != nil && s.ClusterMode() == "dual_pi" && !isLocalEngine {
 		out = append(out, Check{
 			Name:   "research engine reachable",
 			OK:     engineLive,
 			Detail: pick(engineLive, "", "no engine answered on the local network"),
 		})
-	} else if s.ClusterMode() == "pi5_only" {
+	} else {
 		out = append(out, Check{
 			Name:   "standalone mode",
 			OK:     true,

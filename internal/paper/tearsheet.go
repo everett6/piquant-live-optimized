@@ -30,7 +30,7 @@ type DryRunTearSheet struct {
 func ComputeDryRunTearSheet(state DryRunState) DryRunTearSheet {
 	initCap := state.InitialCapital
 	if initCap <= 0 {
-		initCap = 100000.0
+		initCap = 1000.0
 	}
 	equity := state.Equity
 	if equity <= 0 {

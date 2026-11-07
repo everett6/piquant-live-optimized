@@ -146,7 +146,7 @@ func TestFallbackIsolationNeverDrivesPnL(t *testing.T) {
 	if pos.MarkPrice == 999999.0 {
 		t.Errorf("marks should remain frozen during fallback, but mark price updated to %v", pos.MarkPrice)
 	}
-	if st.Equity != 100000.00 {
+	if st.Equity != 1000.00 {
 		t.Errorf("equity should remain frozen at initial capital, got %v", st.Equity)
 	}
 }

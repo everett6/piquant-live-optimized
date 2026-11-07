@@ -542,8 +542,8 @@ func TestPaperDryRunEndpoint(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected state object in response")
 	}
-	if st["initial_capital"] != 100000.0 {
-		t.Errorf("expected initial_capital 100000, got %v", st["initial_capital"])
+	if st["initial_capital"] != 1000.0 {
+		t.Errorf("expected initial_capital 1000, got %v", st["initial_capital"])
 	}
 	if _, ok := res["tearsheet"].(map[string]any); !ok {
 		t.Errorf("expected tearsheet object in /api/paper/dryrun response")

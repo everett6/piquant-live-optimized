@@ -143,12 +143,12 @@ sudo reboot
 
 ## Starting the 14-Day Paper Money Dry Run
 
-PiQuant includes a continuous, autonomous 14-day ($100,000.00 USDT) dry-run engine that streams public live Binance L2 market data (no API keys required).
+PiQuant includes a continuous, autonomous 14-day ($1,000.00 USDT) dry-run engine that streams public live Binance L2 market data (no API keys required).
 
 ### Option A: Interactive Foreground Run
 ```bash
 # Standard 14-day dry run on pure live Binance feeds (fallback disabled by default):
-piquant dry-run --capital 100000 --duration-hours 336 --addr :8080
+piquant dry-run --capital 1000 --duration-hours 336 --addr :8080
 
 # Opt-in to local synthetic fallback when offline (freezes mark prices & pauses quoting while down):
 piquant dry-run --fallback

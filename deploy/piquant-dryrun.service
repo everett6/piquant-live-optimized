@@ -1,7 +1,7 @@
 [Unit]
 Description=PiQuant 14-Day Autonomous Paper Money Dry Run Service (Raspberry Pi 5)
-After=network-online.target avahi-daemon.service
-Wants=network-online.target
+After=network-online.target time-sync.target avahi-daemon.service
+Wants=network-online.target time-sync.target
 Documentation=https://github.com/everett6/PiQuant
 
 [Service]
@@ -9,7 +9,7 @@ Type=simple
 User=piquant
 Group=piquant
 WorkingDirectory=/var/lib/piquant
-ExecStart=/usr/local/bin/piquant dry-run --addr :8080 --data /var/lib/piquant/data --log-dir /var/log/piquant --secrets-dir /etc/piquant --duration-hours 336 --capital 100000 --max-drawdown 2.0
+ExecStart=/usr/local/bin/piquant dry-run --addr :8080 --data /var/lib/piquant/data --log-dir /var/log/piquant --secrets-dir /etc/piquant --duration-hours 336 --capital 1000 --max-drawdown 2.0
 Restart=always
 RestartSec=3s
 
